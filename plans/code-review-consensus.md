@@ -96,10 +96,19 @@ ongoing thread like frame-main's chat sessions.
 each harness's stream-json into one event vocabulary) is the closest
 existing reference and likely reusable pattern.
 
+**Webhook payload.** Not spec'd in advance — carries whatever the review
+job actually needs to do its work (repo URL, PR branch, target branch,
+credentials/access to clone). Shape follows function, not a predefined
+contract.
+
+**Admin-tracked metrics.** Deferred — will define once the service is
+running in production and it's clear what's worth tracking. The one
+setting known to be required now is the round cap (turn limit before
+consolidation), configurable per run through the admin surface.
+
 ## Open questions / not yet decided
 
-- Exact FastAPI route list and payload shape for the ADO webhook.
-- What admin-tracked metrics matter beyond round cap (run duration,
-  disagreement rate, etc.).
+- Exact FastAPI route list for the ADO webhook (payload shape resolved —
+  whatever the job needs; route/method still TBD).
 - What happens when an agent revises a finding the other side already
   marked resolved in an earlier round.
