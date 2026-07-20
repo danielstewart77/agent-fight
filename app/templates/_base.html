@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Agent Fight{% endblock %}</title>
+  <style>
+    :root {
+      --bg: #0f1115;
+      --panel: #181b22;
+      --border: #262b35;
+      --fg: #e8ecf1;
+      --muted: #8a93a3;
+      --accent: #4f8cff;
+      --danger: #ff6b6b;
+      --ok: #2bd07f;
+      --warn: #f5a623;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--fg);
+    }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    nav {
+      background: var(--panel);
+      border-bottom: 1px solid var(--border);
+      padding: 12px 24px;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+    nav .brand { font-weight: 600; }
+    nav .spacer { flex: 1; }
+    main { max-width: 720px; margin: 32px auto; padding: 0 24px; }
+    h1 { margin-top: 0; font-size: 24px; }
+    h2 { margin-top: 32px; font-size: 18px; color: var(--muted); }
+    label { display: block; margin: 12px 0 4px; color: var(--muted); }
+    input[type="text"], input[type="password"], input[type="number"] {
+      width: 100%;
+      height: 36px;
+      padding: 0 10px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      color: var(--fg);
+      font: inherit;
+      vertical-align: middle;
+      box-sizing: border-box;
+    }
+    textarea {
+      width: 100%;
+      padding: 8px 10px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      color: var(--fg);
+      font: inherit;
+      box-sizing: border-box;
+    }
+    select {
+      width: 100%;
+      height: 36px;
+      padding: 0 10px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      color: var(--fg);
+      font: inherit;
+    }
+    button, .button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      height: 36px;
+      padding: 0 16px;
+      background: var(--accent);
+      color: white;
+      border: 0;
+      border-radius: 4px;
+      font: inherit;
+      line-height: 1;
+      cursor: pointer;
+      white-space: nowrap;
+      text-decoration: none;
+      box-sizing: border-box;
+    }
+    button:hover, .button:hover { filter: brightness(1.1); text-decoration: none; }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 20px;
+      margin: 16px 0;
+    }
+    .error { color: var(--danger); }
+    .ok { color: var(--ok); }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--border); }
+    th { color: var(--muted); font-weight: 500; }
+    .form-footer {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 16px;
+      margin-top: 16px;
+      padding-top: 12px;
+      border-top: 1px solid var(--border);
+    }
+  </style>
+</head>
+<body>
+  {% block nav %}
+  <nav>
+    <span class="brand">Agent Fight</span>
+    {% if request.session.get('admin') %}
+    <a href="/admin/">Dashboard</a>
+    <a href="/admin/settings">Settings</a>
+    <span class="spacer"></span>
+    <span>admin</span>
+    <form method="post" action="/logout" style="display:inline">
+      <button type="submit">Log out</button>
+    </form>
+    {% else %}
+    <span class="spacer"></span>
+    <a href="/login">Log in</a>
+    {% endif %}
+  </nav>
+  {% endblock %}
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

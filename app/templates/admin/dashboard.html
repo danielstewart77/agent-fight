@@ -1,0 +1,15 @@
+{% extends "_base.html" %}
+{% block title %}Admin — Agent Fight{% endblock %}
+{% block content %}
+<h1>Admin</h1>
+<div class="card">
+  <table>
+    <tbody>
+      <tr>
+        <td><a href="/admin/settings">Settings</a></td>
+        <td>{% if settings_configured %}<span class="ok">configured</span>{% else %}<span class="error">not yet configured</span>{% endif %}</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+{% endblock %}

@@ -1,0 +1,50 @@
+{% extends "_base.html" %}
+{% block title %}Settings — Agent Fight{% endblock %}
+{% block content %}
+<h1>Settings</h1>
+<p>Run configuration for the code-review consensus loop: the round cap, the
+   Azure DevOps account/org/project connection and its PAT, the webhook
+   shared secret used to authenticate inbound ADO calls, and the clone
+   credential the per-review container uses to pull the target repo.
+   Secret fields are write-only — the stored value is never echoed back;
+   leave a secret field blank to keep the current value.</p>
+
+<div class="card" style="max-width: 640px;">
+  <form method="post" action="/admin/settings">
+    <label for="round_cap">Round cap</label>
+    <input type="number" id="round_cap" name="round_cap" min="1" step="1"
+           value="{{ settings.round_cap }}" required>
+
+    <label for="ado_organization">ADO organization</label>
+    <input type="text" id="ado_organization" name="ado_organization"
+           value="{{ settings.ado_organization or '' }}" placeholder="e.g. contoso">
+
+    <label for="ado_project">ADO project</label>
+    <input type="text" id="ado_project" name="ado_project"
+           value="{{ settings.ado_project or '' }}" placeholder="e.g. widgets">
+
+    <label for="ado_pat">ADO PAT <span style="color:var(--muted);">(PR-comment permission — {% if settings.ado_pat %}set{% else %}not set{% endif %})</span></label>
+    <input type="password" id="ado_pat" name="ado_pat" autocomplete="new-password"
+           placeholder="leave blank to keep current value">
+
+    <label for="webhook_secret">Webhook shared secret <span style="color:var(--muted);">({% if settings.webhook_secret %}set{% else %}not set{% endif %})</span></label>
+    <input type="password" id="webhook_secret" name="webhook_secret" autocomplete="new-password"
+           placeholder="leave blank to keep current value">
+
+    <label for="clone_credential_kind">Clone credential kind</label>
+    <select id="clone_credential_kind" name="clone_credential_kind">
+      {% for k in kinds %}
+      <option value="{{ k }}" {% if k == settings.clone_credential_kind %}selected{% endif %}>{{ k }}</option>
+      {% endfor %}
+    </select>
+
+    <label for="clone_credential_secret">Clone credential secret <span style="color:var(--muted);">(token or SSH private key — {% if settings.clone_credential_secret %}set{% else %}not set{% endif %})</span></label>
+    <textarea id="clone_credential_secret" name="clone_credential_secret" rows="4"
+              placeholder="leave blank to keep current value"></textarea>
+
+    <div class="form-footer">
+      <button type="submit">Save</button>
+    </div>
+  </form>
+</div>
+{% endblock %}

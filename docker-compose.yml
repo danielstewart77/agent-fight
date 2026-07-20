@@ -1,0 +1,12 @@
+services:
+  agent-fight:
+    image: agent-fight:latest
+    build: .
+    container_name: ${CONTAINER_NAME:-agent-fight}
+    env_file:
+      - .env
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8890}:8890"
+    volumes:
+      - ./data:/app/data
