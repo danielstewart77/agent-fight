@@ -81,10 +81,11 @@ harness-type resolver (`claude` / `codex` / future harnesses).
 container for the review (frame-main's `DockerProvisioner` shells out to
 `docker run` per session — same pattern here, one container per PR review
 rather than per chat thread). Inside the container: clone the repo once,
-checkout the target branch as the primary tree, then `git worktree add` a
-second directory for the PR branch off the same clone — both branches on
-disk simultaneously without a second clone, giving the harnesses (or a
-precomputed diff) a clean before/after surface. Run the round loop from
+fetch both the target branch and the PR branch, checkout the PR branch as
+the single working tree. No second worktree needed — `git diff target..pr`
+works against a fetched-but-not-checked-out ref, so one clone plus one
+checkout is enough for both the diff surface and full file content when a
+harness needs more context than the diff hunks. Run the round loop from
 Core loop above inside that container. Once the coordinator produces the
 final review (converged or round-capped synthesis), post it back and tear
 the container down — no idle persistence, a review is one-shot, not an
