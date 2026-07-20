@@ -106,9 +106,27 @@ running in production and it's clear what's worth tracking. The one
 setting known to be required now is the round cap (turn limit before
 consolidation), configurable per run through the admin surface.
 
+**Unresolved disagreement at round cap.** If the two agents never converge
+on a finding, it is not forced to a winner — it stays an open item in the
+final review. The coordinator makes the disagreement itself visible in the
+write-up rather than silently picking a side, e.g. "Codex has marked this
+issue as closed, but Claude still considers it an issue." This is the same
+inclusive-synthesis behavior as the round-cap termination case, applied to
+a single finding rather than the whole run.
+
 ## Open questions / not yet decided
 
 - Exact FastAPI route list for the ADO webhook (payload shape resolved —
   whatever the job needs; route/method still TBD).
-- What happens when an agent revises a finding the other side already
-  marked resolved in an earlier round.
+
+## Blockers before first launch
+
+- Decide the reopen-after-resolved policy — resolved above.
+- Deploy `inference-proxy` — agent-fight's harness calls route through it,
+  can't run without it live.
+- Azure DevOps specifics: target org/project, webhook auth so arbitrary
+  calls aren't accepted, and how the final review posts back (PR comment
+  via ADO REST API needs a service account/PAT with comment permission).
+- Clone credentials: token or SSH key for the container to pull a private
+  ADO repo, stored in the same keyring pattern as the rest of the minds.
+- A real target repo to point the webhook at for the first test run.
