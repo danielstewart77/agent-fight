@@ -56,11 +56,49 @@ on Daniel.
   code review is designed to surface all unique perspectives rather than
   force a single winner.
 
+## Infrastructure
+
+**Trigger.** Azure DevOps pull request submission calls a webhook configured
+in ADO's PR pipeline. The web service listens for that call and kicks off a
+review run.
+
+**Provider access.** Reuses the existing `inference-proxy` project
+(`~/Storage/Dev/inference-proxy`) — an API-key-authed FastAPI proxy that
+routes requests from any harness to that harness's underlying provider.
+agent-fight's harnesses call through it rather than holding provider
+credentials directly.
+
+**Web service shape.** A new FastAPI server, structured like
+inference-proxy's `app/{main.py, config.py, db.py, orm.py, auth.py}` split:
+a webhook route to receive the ADO PR call, an admin surface for run
+settings (round cap, whatever metrics we decide to track), generalizing
+inference-proxy's `deployments.py` name-based provider resolution into a
+harness-type resolver (`claude` / `codex` / future harnesses).
+
+**Per-review container lifecycle.** Modeled on `frame-main`
+(`~/Storage/Dev/frame-main`, see its `DESIGN.md`, `sandbox/provision.py`,
+`sandbox/entrypoint.sh`, `sessions.py`): on webhook, create one ephemeral
+container for the review (frame-main's `DockerProvisioner` shells out to
+`docker run` per session — same pattern here, one container per PR review
+rather than per chat thread). Inside the container: clone the repo once,
+checkout the target branch as the primary tree, then `git worktree add` a
+second directory for the PR branch off the same clone — both branches on
+disk simultaneously without a second clone, giving the harnesses (or a
+precomputed diff) a clean before/after surface. Run the round loop from
+Core loop above inside that container. Once the coordinator produces the
+final review (converged or round-capped synthesis), post it back and tear
+the container down — no idle persistence, a review is one-shot, not an
+ongoing thread like frame-main's chat sessions.
+
+**Harness adapter shape.** Still to design in detail, but frame-main's
+`harness.py` (`build_argv()` per harness type, `parse_line()` normalizing
+each harness's stream-json into one event vocabulary) is the closest
+existing reference and likely reusable pattern.
+
 ## Open questions / not yet decided
 
-- Web service infrastructure for the management interface (round cap
-  config, run history, etc.) — next topic to design.
-- Harness adapter shape for Codex CLI and Claude CLI (spawn/send/kill
-  pattern reused from hive_mind's `minds/<name>/implementation.py`?).
+- Exact FastAPI route list and payload shape for the ADO webhook.
+- What admin-tracked metrics matter beyond round cap (run duration,
+  disagreement rate, etc.).
 - What happens when an agent revises a finding the other side already
   marked resolved in an earlier round.
