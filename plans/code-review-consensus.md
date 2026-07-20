@@ -71,9 +71,18 @@ credentials directly.
 **Web service shape.** A new FastAPI server, structured like
 inference-proxy's `app/{main.py, config.py, db.py, orm.py, auth.py}` split:
 a webhook route to receive the ADO PR call, an admin surface for run
-settings (round cap, whatever metrics we decide to track), generalizing
-inference-proxy's `deployments.py` name-based provider resolution into a
-harness-type resolver (`claude` / `codex` / future harnesses).
+settings, generalizing inference-proxy's `deployments.py` name-based
+provider resolution into a harness-type resolver (`claude` / `codex` /
+future harnesses).
+
+**Admin-configured settings.** Not `.env`-only — mirrors inference-proxy's
+`app/admin/models.py` CRUD-over-DB pattern rather than static config.
+Managed through the admin page: the round cap, the Azure DevOps
+account/org/project connection and its PAT, the webhook shared secret
+used to authenticate inbound ADO calls, and the clone credential (token or
+SSH key) the container uses to pull the target repo. Secrets stored the
+same way inference-proxy stores API keys (hashed/DB-backed, not plaintext
+in a repo file), editable without a redeploy.
 
 **Per-review container lifecycle.** Modeled on `frame-main`
 (`~/Storage/Dev/frame-main`, see its `DESIGN.md`, `sandbox/provision.py`,
@@ -124,9 +133,12 @@ a single finding rather than the whole run.
 - Decide the reopen-after-resolved policy — resolved above.
 - Deploy `inference-proxy` — agent-fight's harness calls route through it,
   can't run without it live.
-- Azure DevOps specifics: target org/project, webhook auth so arbitrary
-  calls aren't accepted, and how the final review posts back (PR comment
-  via ADO REST API needs a service account/PAT with comment permission).
-- Clone credentials: token or SSH key for the container to pull a private
-  ADO repo, stored in the same keyring pattern as the rest of the minds.
+- Build the admin-configured settings surface (see Admin-configured
+  settings above) so the ADO account/org/project, webhook shared secret,
+  and clone credential are entered through the admin page rather than
+  hardcoded — this is now app functionality to build, not a pre-launch
+  config step done by hand.
+- Once that surface exists: actually enter the Azure DevOps org/project,
+  a PAT with PR-comment permission for posting the final review back, the
+  webhook shared secret, and the clone credential for the target repo.
 - A real target repo to point the webhook at for the first test run.
