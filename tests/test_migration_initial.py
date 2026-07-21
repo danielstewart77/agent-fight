@@ -19,6 +19,8 @@ EXPECTED_SETTINGS_COLUMNS = {
     "webhook_secret",
     "clone_credential_kind",
     "clone_credential_secret",
+    "proxy_base_url",
+    "proxy_api_key",
     "updated_at",
 }
 
@@ -51,6 +53,18 @@ def test_settings_table_has_expected_columns(tmp_path):
     finally:
         engine.dispose()
     assert EXPECTED_SETTINGS_COLUMNS <= cols
+
+
+def test_settings_table_has_inference_proxy_columns(tmp_path):
+    """Migration 0002 adds the inference-proxy connection columns."""
+    db = tmp_path / "agent_fight.db"
+    _upgrade_into(db)
+    engine = create_engine(f"sqlite:///{db}")
+    try:
+        cols = {c["name"] for c in inspect(engine).get_columns("settings")}
+    finally:
+        engine.dispose()
+    assert {"proxy_base_url", "proxy_api_key"} <= cols
 
 
 def test_migration_does_not_insert_the_singleton_row(tmp_path):

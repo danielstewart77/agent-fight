@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import logging
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -11,11 +14,40 @@ from app.admin import login as admin_login
 from app.admin import settings as admin_settings
 from app.auth import is_admin_session, is_redirect_exception
 from app.config import config
+from app.db import SessionLocal
+from app.proxy import ProxyNotConfigured, load_proxy_config, ProxyClient
+from app.runner import ReviewDispatcher
 from app.webhooks import router as webhooks_router
+
+logger = logging.getLogger("agent_fight.main")
+
+
+async def _proxy_status() -> str:
+    """'up' | 'down' | 'unconfigured' — a non-fatal diagnostic of the proxy."""
+    async with SessionLocal() as session:
+        try:
+            base_url, api_key = await load_proxy_config(session)
+        except ProxyNotConfigured:
+            return "unconfigured"
+    async with ProxyClient(base_url, api_key) as pc:
+        return "up" if await pc.ping() else "down"
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    # Non-fatal startup ping: report the proxy's reachability but never block
+    # boot on it — the admin still needs to log in and configure settings.
+    status = await _proxy_status()
+    logger.info("inference proxy status at startup: %s", status)
+    yield
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="Agent Fight", version="0.1.0")
+    app = FastAPI(title="Agent Fight", version="0.1.0", lifespan=_lifespan)
+
+    # Fire-and-forget review runs are dispatched through this. Held on
+    # app.state so tests can swap in a recording fake.
+    app.state.review_dispatcher = ReviewDispatcher()
 
     app.add_middleware(
         SessionMiddleware,
@@ -37,6 +69,10 @@ def create_app() -> FastAPI:
     @app.get("/health")
     async def health():
         return {"status": "healthy"}
+
+    @app.get("/health/proxy")
+    async def health_proxy():
+        return {"proxy": await _proxy_status()}
 
     @app.get("/")
     async def root(request: Request):

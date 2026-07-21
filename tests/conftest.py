@@ -70,11 +70,27 @@ async def client(monkeypatch):
     app = create_app()
     app.dependency_overrides[get_session] = _get_test_session
 
+    # Replace the real dispatcher (which would launch Docker in the background)
+    # with a no-op recorder, and expose it on the client for assertions.
+    recorder = RecordingDispatcher()
+    app.state.review_dispatcher = recorder
+
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        ac.dispatcher = recorder  # type: ignore[attr-defined]
         yield ac
 
     await engine.dispose()
+
+
+class RecordingDispatcher:
+    """Stand-in for ReviewDispatcher: records dispatched jobs, launches nothing."""
+
+    def __init__(self) -> None:
+        self.jobs = []
+
+    def dispatch(self, job) -> None:
+        self.jobs.append(job)
 
 
 async def login(ac: AsyncClient) -> None:
@@ -83,3 +99,22 @@ async def login(ac: AsyncClient) -> None:
         data={"username": ADMIN_USERNAME, "password": ADMIN_PASSWORD},
     )
     assert resp.status_code in (200, 303)
+
+
+def sample_ado_payload(event_type: str = "git.pullrequest.created") -> dict:
+    """A minimal but well-formed ADO PR service-hook payload for tests."""
+    return {
+        "eventType": event_type,
+        "resource": {
+            "pullRequestId": 42,
+            "sourceRefName": "refs/heads/feature-x",
+            "targetRefName": "refs/heads/main",
+            "repository": {
+                "id": "repo-guid-123",
+                "name": "widgets",
+                "remoteUrl": "https://dev.azure.com/contoso/widgets/_git/widgets",
+                "project": {"name": "widgets-project"},
+            },
+            "_links": {"web": {"href": "https://dev.azure.com/contoso/_git/widgets/pullrequest/42"}},
+        },
+    }

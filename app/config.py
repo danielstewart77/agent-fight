@@ -17,6 +17,10 @@ class Config:
     port: int = int(os.getenv("PORT", "8890"))
     enable_logging: bool = os.getenv("ENABLE_LOGGING", "true").lower() == "true"
 
+    # Docker image used for each per-review container. Must have git and the
+    # harness CLIs (claude, codex) installed. See app/container.py.
+    review_image: str = os.getenv("REVIEW_IMAGE", "agent-fight-review:latest")
+
     # SQLite database. Single file, no server. Override with an absolute path
     # to relocate it (e.g. onto a mounted volume).
     db_path: str = os.getenv("DB_PATH", str(REPO_ROOT / "data" / "agent_fight.db"))

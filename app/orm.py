@@ -25,11 +25,11 @@ class Base(DeclarativeBase):
 class Settings(Base):
     """Singleton row (id is always 1) holding the admin-configured run settings.
 
-    Secrets (`ado_pat`, `webhook_secret`, `clone_credential_secret`) are
-    stored the same way inference-proxy stores API keys: DB-backed and off
-    the filesystem, plaintext-in-DB (not a repo file) — not full
-    encryption-at-rest. The admin console never echoes a stored secret back;
-    a blank field on save leaves it untouched (see app/admin/settings.py).
+    Secrets (`ado_pat`, `webhook_secret`, `clone_credential_secret`,
+    `proxy_api_key`) are stored the same way inference-proxy stores API keys:
+    DB-backed and off the filesystem, plaintext-in-DB (not a repo file) — not
+    full encryption-at-rest. The admin console never echoes a stored secret
+    back; a blank field on save leaves it untouched (see app/admin/settings.py).
     """
 
     __tablename__ = "settings"
@@ -49,6 +49,13 @@ class Settings(Base):
 
     # Shared secret used to authenticate inbound ADO webhook calls.
     webhook_secret: Mapped[Optional[str]] = mapped_column(Unicode(512), nullable=True)
+
+    # Inference-proxy connection. Harnesses inside the review container route
+    # their provider calls through this proxy (base URL + key injected into
+    # their env), and the coordinator calls it directly for its own reasoning.
+    # `proxy_base_url` is non-secret; `proxy_api_key` is a write-only secret.
+    proxy_base_url: Mapped[Optional[str]] = mapped_column(Unicode(512), nullable=True)
+    proxy_api_key: Mapped[Optional[str]] = mapped_column(Unicode(2048), nullable=True)
 
     # Clone credential the per-review container uses to pull the target
     # repo: a PAT/token or an SSH private key.

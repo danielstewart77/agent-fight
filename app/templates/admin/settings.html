@@ -5,7 +5,8 @@
 <p>Run configuration for the code-review consensus loop: the round cap, the
    Azure DevOps account/org/project connection and its PAT, the webhook
    shared secret used to authenticate inbound ADO calls, and the clone
-   credential the per-review container uses to pull the target repo.
+   credential the per-review container uses to pull the target repo, and the
+   inference-proxy connection the harnesses and coordinator route through.
    Secret fields are write-only — the stored value is never echoed back;
    leave a secret field blank to keep the current value.</p>
 
@@ -29,6 +30,14 @@
 
     <label for="webhook_secret">Webhook shared secret <span style="color:var(--muted);">({% if settings.webhook_secret %}set{% else %}not set{% endif %})</span></label>
     <input type="password" id="webhook_secret" name="webhook_secret" autocomplete="new-password"
+           placeholder="leave blank to keep current value">
+
+    <label for="proxy_base_url">Inference proxy base URL</label>
+    <input type="text" id="proxy_base_url" name="proxy_base_url"
+           value="{{ settings.proxy_base_url or '' }}" placeholder="e.g. https://proxy.internal">
+
+    <label for="proxy_api_key">Inference proxy API key <span style="color:var(--muted);">({% if settings.proxy_api_key %}set{% else %}not set{% endif %})</span></label>
+    <input type="password" id="proxy_api_key" name="proxy_api_key" autocomplete="new-password"
            placeholder="leave blank to keep current value">
 
     <label for="clone_credential_kind">Clone credential kind</label>

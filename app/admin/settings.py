@@ -52,6 +52,18 @@ def _validate_round_cap(raw: str) -> int:
     return val
 
 
+def _validate_proxy_base_url(raw: str | None, *, max_len: int = 512) -> str | None:
+    """Non-secret optional URL. Blank clears it; a set value must be http(s)."""
+    val = (raw or "").strip()
+    if not val:
+        return None
+    if len(val) > max_len:
+        raise HTTPException(status_code=400, detail=f"proxy_base_url must be {max_len} characters or fewer")
+    if not (val.startswith("http://") or val.startswith("https://")):
+        raise HTTPException(status_code=400, detail="proxy_base_url must start with http:// or https://")
+    return val
+
+
 def _validate_clone_credential_kind(raw: str) -> str:
     val = (raw or "").strip()
     if val not in VALID_CLONE_CREDENTIAL_KINDS:
@@ -115,6 +127,8 @@ async def update_settings(
     webhook_secret: str = Form(""),
     clone_credential_kind: str = Form("token"),
     clone_credential_secret: str = Form(""),
+    proxy_base_url: str = Form(""),
+    proxy_api_key: str = Form(""),
     session: AsyncSession = Depends(get_session),
 ):
     await require_html_admin(request)
@@ -127,6 +141,7 @@ async def update_settings(
     # clears them).
     row.ado_organization = _cleared_or_set(ado_organization, max_len=256)
     row.ado_project = _cleared_or_set(ado_project, max_len=256)
+    row.proxy_base_url = _validate_proxy_base_url(proxy_base_url)
 
     # Secret fields: only overwritten when the submitted value is non-blank.
     new_ado_pat = _optional_secret(ado_pat, max_len=2048)
@@ -140,6 +155,10 @@ async def update_settings(
     new_clone_secret = _optional_secret(clone_credential_secret, max_len=8192)
     if new_clone_secret is not None:
         row.clone_credential_secret = new_clone_secret
+
+    new_proxy_key = _optional_secret(proxy_api_key, max_len=2048)
+    if new_proxy_key is not None:
+        row.proxy_api_key = new_proxy_key
 
     await session.commit()
     return RedirectResponse("/admin/settings", status_code=303)
