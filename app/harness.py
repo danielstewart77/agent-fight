@@ -1,21 +1,23 @@
 """Harness adapter: build each CLI's invocation, normalize its output, and
-point it at the inference proxy.
+wire it to its inference proxy — exactly the way the proxy's own installers do.
 
-This is the "harness-type resolver" the design calls for, generalized from
-inference-proxy's name-based provider resolution. Three pure pieces:
+Three pure pieces plus the Codex config builders:
 
   - `build_argv`   : the argv to run a harness non-interactively in the container
   - `parse_line`   : one stream-json line -> a normalized `Event`
-  - `harness_env`  : env that points the CLI's provider calls at the proxy
+  - `harness_env`  : provider env vars for the harness
+  - `codex_auth_json` / `codex_config_toml` : the files Codex reads
 
-Keeping these pure means the whole adapter is unit-testable without the CLIs
-installed. The findings each harness produces are read from the JSON file it
-writes (see the coordinator), NOT scraped from the event stream — the stream is
-only for progress/logging and completion/error detection.
+Provider wiring mirrors /home/daniel/azure-openai-proxy/install-{claude,codex}.sh:
+  - Claude: ANTHROPIC_BASE_URL (bare root) + ANTHROPIC_API_KEY. ANTHROPIC_AUTH_TOKEN
+    is deliberately NOT set — it overrides the key and routes back to
+    api.anthropic.com.
+  - Codex: reads ~/.codex/auth.json and ~/.codex/config.toml (a custom
+    model_provider with wire_api="responses"), base URL WITH /v1. Env vars are
+    written too as a fallback, but the files are authoritative.
 
-ASSUMPTIONS (isolated here — confirm against the installed CLIs): the exact
-flags, the per-line JSON schemas, and the provider env-var names each CLI
-honors for a base-URL/key override.
+The findings each harness produces are read from the JSON file it writes (see
+the coordinator), NOT scraped from the event stream.
 """
 
 from __future__ import annotations
@@ -25,10 +27,16 @@ import json
 from app.orm import Settings
 from app.review.models import Event, HarnessType
 
+CODEX_PROVIDER_ID = "azure_proxy"
+
 
 def resolve_harness(name: str) -> HarnessType:
     """Map a free-form name to a HarnessType (raises ValueError if unknown)."""
     return HarnessType(name.strip().lower())
+
+
+def harness_model(harness: HarnessType, settings: Settings) -> str | None:
+    return settings.claude_model if harness is HarnessType.CLAUDE else settings.codex_model
 
 
 def build_argv(
@@ -42,9 +50,8 @@ def build_argv(
     """The command to run `harness` once, non-interactively, in the container.
 
     The prompt (read from `prompt_path`) instructs the harness to write its
-    structured findings to `findings_path`; we surface both paths to the
-    harness via the prompt text rather than a dedicated flag, since neither CLI
-    has a "write findings here" option.
+    structured findings to `findings_path`. Both run inside the sealed,
+    ephemeral review container, so Claude runs with permission prompts skipped.
     """
     if harness is HarnessType.CLAUDE:
         argv = [
@@ -53,6 +60,7 @@ def build_argv(
             "--output-format",
             "stream-json",
             "--verbose",
+            "--dangerously-skip-permissions",
             "--add-dir",
             workdir,
         ]
@@ -121,25 +129,48 @@ def parse_line(harness: HarnessType, line: str) -> Event | None:
 
 
 def harness_env(harness: HarnessType, settings: Settings) -> dict[str, str]:
-    """Env that routes the harness's provider calls through the proxy.
-
-    Returns an empty dict when the proxy is unconfigured, so the caller can
-    decide whether that is fatal (it is, for a real run — checked upstream).
-    """
-    base_url = settings.proxy_base_url or ""
-    api_key = settings.proxy_api_key or ""
-    if not base_url or not api_key:
-        return {}
-
+    """Provider env for the harness. Empty dict when its proxy is unconfigured
+    (the caller decides whether that is fatal)."""
     if harness is HarnessType.CLAUDE:
-        return {
-            "ANTHROPIC_BASE_URL": base_url,
-            "ANTHROPIC_API_KEY": api_key,
-            "ANTHROPIC_AUTH_TOKEN": api_key,
-        }
+        url, key = settings.claude_proxy_url, settings.claude_proxy_key
+        if not url or not key:
+            return {}
+        # NOTE: ANTHROPIC_AUTH_TOKEN is intentionally absent — it would override
+        # ANTHROPIC_API_KEY and route away from the proxy (see install-claude.sh).
+        return {"ANTHROPIC_BASE_URL": url, "ANTHROPIC_API_KEY": key}
     if harness is HarnessType.CODEX:
-        return {
-            "OPENAI_BASE_URL": base_url,
-            "OPENAI_API_KEY": api_key,
-        }
+        url, key = settings.codex_proxy_url, settings.codex_proxy_key
+        if not url or not key:
+            return {}
+        return {"OPENAI_BASE_URL": url, "OPENAI_API_KEY": key}
     raise ValueError(f"unknown harness: {harness!r}")
+
+
+def codex_auth_json(api_key: str) -> str:
+    """~/.codex/auth.json — Codex prefers this over the env var on every call."""
+    return json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": api_key})
+
+
+def codex_config_toml(base_url: str, model: str | None) -> str:
+    """~/.codex/config.toml — a custom provider routed at the proxy.
+
+    Mirrors install-codex.sh: top-level openai_base_url/model/model_provider
+    plus a [model_providers.azure_proxy] block with wire_api="responses". Using
+    a custom provider (not the built-in openai one) keeps Codex from enabling
+    OpenAI-only wire experiments the proxy can't forward.
+    """
+    lines = [
+        f'openai_base_url = "{base_url}"',
+    ]
+    if model:
+        lines.append(f'model = "{model}"')
+    lines += [
+        f'model_provider = "{CODEX_PROVIDER_ID}"',
+        "",
+        f"[model_providers.{CODEX_PROVIDER_ID}]",
+        'name = "Azure OpenAI Proxy"',
+        f'base_url = "{base_url}"',
+        'env_key = "OPENAI_API_KEY"',
+        'wire_api = "responses"',
+    ]
+    return "\n".join(lines) + "\n"

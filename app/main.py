@@ -12,13 +12,14 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from app.admin import account as admin_account
 from app.admin import login as admin_login
+from app.admin import proxy as admin_proxy
 from app.admin import settings as admin_settings
 from app.admin import users as admin_users
 from app.auth import is_authenticated, is_redirect_exception, normalize_username
 from app.config import config
 from app.db import SessionLocal
 from app.orm import User
-from app.proxy import ProxyNotConfigured, load_proxy_config, ProxyClient
+from app.proxy import ProxyNotConfigured, load_coordinator_proxy, ProxyClient
 from app.runner import ReviewDispatcher
 from app.security import hash_password
 from sqlalchemy import func, select
@@ -28,13 +29,13 @@ logger = logging.getLogger("agent_fight.main")
 
 
 async def _proxy_status() -> str:
-    """'up' | 'down' | 'unconfigured' — a non-fatal diagnostic of the proxy."""
+    """'up' | 'down' | 'unconfigured' — non-fatal diagnostic of the coordinator proxy."""
     async with SessionLocal() as session:
         try:
-            base_url, api_key = await load_proxy_config(session)
+            base_url, api_key, model = await load_coordinator_proxy(session)
         except ProxyNotConfigured:
             return "unconfigured"
-    async with ProxyClient(base_url, api_key) as pc:
+    async with ProxyClient(base_url, api_key, model=model) as pc:
         return "up" if await pc.ping() else "down"
 
 
@@ -120,6 +121,7 @@ def create_app() -> FastAPI:
     # ---- Admin console (session-authed) --------------------------------------
     app.include_router(admin_login.router)
     app.include_router(admin_settings.router)
+    app.include_router(admin_proxy.router)
     app.include_router(admin_account.router)
     app.include_router(admin_users.router)
 

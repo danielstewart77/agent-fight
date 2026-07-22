@@ -19,8 +19,6 @@ EXPECTED_SETTINGS_COLUMNS = {
     "webhook_secret",
     "clone_credential_kind",
     "clone_credential_secret",
-    "proxy_base_url",
-    "proxy_api_key",
     "updated_at",
 }
 
@@ -55,8 +53,8 @@ def test_settings_table_has_expected_columns(tmp_path):
     assert EXPECTED_SETTINGS_COLUMNS <= cols
 
 
-def test_settings_table_has_inference_proxy_columns(tmp_path):
-    """Migration 0002 adds the inference-proxy connection columns."""
+def test_settings_table_has_per_role_proxy_columns(tmp_path):
+    """Migration 0004 replaces the generic proxy columns with per-role ones."""
     db = tmp_path / "agent_fight.db"
     _upgrade_into(db)
     engine = create_engine(f"sqlite:///{db}")
@@ -64,7 +62,14 @@ def test_settings_table_has_inference_proxy_columns(tmp_path):
         cols = {c["name"] for c in inspect(engine).get_columns("settings")}
     finally:
         engine.dispose()
-    assert {"proxy_base_url", "proxy_api_key"} <= cols
+    per_role = {
+        f"{role}_{suffix}"
+        for role in ("claude", "codex", "coord")
+        for suffix in ("proxy_url", "proxy_key", "model")
+    }
+    assert per_role <= cols
+    # The old generic columns are gone.
+    assert "proxy_base_url" not in cols and "proxy_api_key" not in cols
 
 
 def test_users_table_created_with_expected_columns(tmp_path):

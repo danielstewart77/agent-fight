@@ -1,0 +1,49 @@
+{% extends "_base.html" %}
+{% block title %}Proxy — Agent Fight{% endblock %}
+{% block content %}
+<h1>Inference proxy</h1>
+<p>Each harness and the coordinator connect to the inference proxy
+   independently. Enter the base URL and API key for each, then pick a model.
+   The model list is fetched live from the proxy's <code>/models</code> using
+   the saved key — on first setup, enter the URL + key and <strong>Save</strong>,
+   then reload to pick a model. Base URLs may be the bare root or include
+   <code>/v1</code>. API keys are write-only; leave blank to keep the current
+   value.</p>
+
+<form method="post" action="/admin/proxy">
+  {% for b in blocks %}
+  <div class="card" style="max-width: 640px;">
+    <h2 style="margin-top:0; color:var(--fg);">{{ b.label }}</h2>
+
+    <label for="{{ b.role }}_proxy_url">Base URL</label>
+    <input type="text" id="{{ b.role }}_proxy_url" name="{{ b.role }}_proxy_url"
+           value="{{ b.url }}" placeholder="e.g. https://ulmaiproxy.utsystem.edu">
+
+    <label for="{{ b.role }}_proxy_key">API key <span style="color:var(--muted);">({% if b.key_set %}set{% else %}not set{% endif %})</span></label>
+    <input type="password" id="{{ b.role }}_proxy_key" name="{{ b.role }}_proxy_key"
+           autocomplete="new-password" placeholder="leave blank to keep current value">
+
+    <label for="{{ b.role }}_model">Model</label>
+    {% if b.options %}
+    <select id="{{ b.role }}_model" name="{{ b.role }}_model">
+      <option value="">— select a model —</option>
+      {% for m in b.options %}
+      <option value="{{ m }}" {% if m == b.model %}selected{% endif %}>{{ m }}</option>
+      {% endfor %}
+      {% if b.model and b.model not in b.options %}
+      <option value="{{ b.model }}" selected>{{ b.model }} (saved)</option>
+      {% endif %}
+    </select>
+    {% else %}
+    <input type="text" id="{{ b.role }}_model" name="{{ b.role }}_model"
+           value="{{ b.model }}" placeholder="save URL + key, then reload to list models">
+    {% endif %}
+  </div>
+  {% endfor %}
+
+  <div class="form-footer" style="max-width: 640px;">
+    <a href="/admin/proxy">Refresh models</a>
+    <button type="submit">Save</button>
+  </div>
+</form>
+{% endblock %}

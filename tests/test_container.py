@@ -60,3 +60,30 @@ async def test_prepare_repo_raises_on_failed_step():
 async def test_compute_diff_returns_stdout():
     handle = FakeHandle(exec_results={"git -C /work/repo diff": ExecResult(rc=0, stdout="DIFFTEXT")})
     assert await compute_diff(handle, _job()) == "DIFFTEXT"
+
+
+async def test_provision_harnesses_writes_codex_files():
+    from app.container import CONTAINER_HOME, provision_harnesses
+    from app.orm import Settings
+
+    s = Settings(id=1, round_cap=3, clone_credential_kind="token")
+    s.codex_proxy_url = "https://proxy.internal/v1"
+    s.codex_proxy_key = "codex-key"
+    s.codex_model = "gpt-5.5"
+    handle = FakeHandle()
+    await provision_harnesses(handle, s)
+
+    import json
+    auth = json.loads(handle.files[f"{CONTAINER_HOME}/.codex/auth.json"])
+    assert auth == {"auth_mode": "apikey", "OPENAI_API_KEY": "codex-key"}
+    toml = handle.files[f"{CONTAINER_HOME}/.codex/config.toml"]
+    assert 'wire_api = "responses"' in toml and 'model = "gpt-5.5"' in toml
+
+
+async def test_provision_harnesses_noop_when_codex_unconfigured():
+    from app.container import provision_harnesses
+    from app.orm import Settings
+
+    handle = FakeHandle()
+    await provision_harnesses(handle, Settings(id=1, round_cap=3, clone_credential_kind="token"))
+    assert handle.files == {}

@@ -83,15 +83,18 @@ async def _default_run(job: ReviewJob) -> None:
 
 
 def _proxy_reasoner(settings) -> Optional[Callable[[str], Awaitable[str]]]:
-    """A reasoner that reframes cross-exposure material via the proxy, or None
-    (coordinator falls back to passthrough) when the proxy is unconfigured."""
-    if not settings.proxy_base_url or not settings.proxy_api_key:
+    """A reasoner that reframes cross-exposure material via the coordinator
+    proxy, or None (coordinator falls back to passthrough) when it's
+    unconfigured."""
+    if not settings.coord_proxy_url or not settings.coord_proxy_key:
         return None
 
     from app.proxy import ProxyClient
 
     async def reason(structured: str) -> str:
-        async with ProxyClient(settings.proxy_base_url, settings.proxy_api_key) as pc:
+        async with ProxyClient(
+            settings.coord_proxy_url, settings.coord_proxy_key, model=settings.coord_model
+        ) as pc:
             return await pc.complete(
                 system=(
                     "You are the coordinator in a multi-agent code review. Reframe "

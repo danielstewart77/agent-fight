@@ -31,6 +31,8 @@ logger = logging.getLogger("agent_fight.container")
 
 WORKDIR = "/work/repo"
 FINDINGS_DIR = "/work/findings"
+# HOME in the review image (Dockerfile.review). Codex reads its config here.
+CONTAINER_HOME = "/root"
 
 
 @dataclass
@@ -224,6 +226,27 @@ async def prepare_repo(
         res = await handle.exec(argv, env=env or None)
         if not res.ok:
             raise RuntimeError(f"repo prep step {argv!r} failed: {res.stderr.strip()}")
+
+
+async def provision_harnesses(handle: ContainerHandle, settings) -> None:
+    """Write the per-harness proxy config into the container.
+
+    Claude is configured purely through env vars at exec time (see
+    app/harness.py::harness_env), so nothing to write for it. Codex reads
+    ~/.codex/auth.json and ~/.codex/config.toml on every call, so those must
+    exist before `codex` runs. Skipped for Codex when its proxy is unconfigured.
+    """
+    from app.harness import codex_auth_json, codex_config_toml
+
+    if settings.codex_proxy_url and settings.codex_proxy_key:
+        await handle.write_file(
+            f"{CONTAINER_HOME}/.codex/auth.json",
+            codex_auth_json(settings.codex_proxy_key),
+        )
+        await handle.write_file(
+            f"{CONTAINER_HOME}/.codex/config.toml",
+            codex_config_toml(settings.codex_proxy_url, settings.codex_model),
+        )
 
 
 async def compute_diff(handle: ContainerHandle, job: ReviewJob) -> str:

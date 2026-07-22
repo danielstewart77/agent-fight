@@ -1,0 +1,25 @@
+# Per-review container image (agent-fight-review:latest).
+#
+# One ephemeral container per PR review runs here: the app clones the repo into
+# /work, provisions each harness's proxy config (see app/container.py::
+# provision_harnesses + app/harness.py), and runs the Claude and Codex CLIs.
+# It needs git + node/npm + both harness CLIs. It does NOT run the agent-fight
+# web app itself.
+#
+# Build:  docker build -f Dockerfile.review -t agent-fight-review:latest .
+FROM node:20-bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Both harness CLIs, installed globally.
+RUN npm install -g @anthropic-ai/claude-code @openai/codex \
+    && npm cache clean --force
+
+# HOME must be set: Codex reads ~/.codex/{auth.json,config.toml}, which the app
+# writes at provision time (app/container.py). WORKDIR is where the repo clones.
+ENV HOME=/root
+WORKDIR /work
+
+CMD ["sleep", "infinity"]

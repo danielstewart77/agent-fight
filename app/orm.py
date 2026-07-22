@@ -50,8 +50,9 @@ class User(Base):
 class Settings(Base):
     """Singleton row (id is always 1) holding the admin-configured run settings.
 
-    Secrets (`ado_pat`, `webhook_secret`, `clone_credential_secret`,
-    `proxy_api_key`) are stored the same way inference-proxy stores API keys:
+    Secrets (`ado_pat`, `webhook_secret`, `clone_credential_secret`, and the
+    per-role `*_proxy_key` columns) are stored the same way inference-proxy
+    stores API keys:
     DB-backed and off the filesystem, plaintext-in-DB (not a repo file) — not
     full encryption-at-rest. The admin console never echoes a stored secret
     back; a blank field on save leaves it untouched (see app/admin/settings.py).
@@ -75,12 +76,24 @@ class Settings(Base):
     # Shared secret used to authenticate inbound ADO webhook calls.
     webhook_secret: Mapped[Optional[str]] = mapped_column(Unicode(512), nullable=True)
 
-    # Inference-proxy connection. Harnesses inside the review container route
-    # their provider calls through this proxy (base URL + key injected into
-    # their env), and the coordinator calls it directly for its own reasoning.
-    # `proxy_base_url` is non-secret; `proxy_api_key` is a write-only secret.
-    proxy_base_url: Mapped[Optional[str]] = mapped_column(Unicode(512), nullable=True)
-    proxy_api_key: Mapped[Optional[str]] = mapped_column(Unicode(2048), nullable=True)
+    # Per-role inference-proxy connections. Each of the two harnesses and the
+    # coordinator has its own base URL, API key (write-only secret), and model,
+    # configured at /admin/proxy. They differ in practice: the Claude harness
+    # and coordinator speak the Anthropic Messages API (bare-root base URL),
+    # while Codex is OpenAI-compatible (base URL with /v1) and also needs its
+    # config written to files in the container (see app/harness.py). Models are
+    # picked from the proxy's /models listing.
+    claude_proxy_url: Mapped[Optional[str]] = mapped_column(Unicode(512), nullable=True)
+    claude_proxy_key: Mapped[Optional[str]] = mapped_column(Unicode(2048), nullable=True)
+    claude_model: Mapped[Optional[str]] = mapped_column(Unicode(128), nullable=True)
+
+    codex_proxy_url: Mapped[Optional[str]] = mapped_column(Unicode(512), nullable=True)
+    codex_proxy_key: Mapped[Optional[str]] = mapped_column(Unicode(2048), nullable=True)
+    codex_model: Mapped[Optional[str]] = mapped_column(Unicode(128), nullable=True)
+
+    coord_proxy_url: Mapped[Optional[str]] = mapped_column(Unicode(512), nullable=True)
+    coord_proxy_key: Mapped[Optional[str]] = mapped_column(Unicode(2048), nullable=True)
+    coord_model: Mapped[Optional[str]] = mapped_column(Unicode(128), nullable=True)
 
     # Clone credential the per-review container uses to pull the target
     # repo: a PAT/token or an SSH private key.

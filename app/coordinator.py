@@ -28,8 +28,15 @@ import json
 import logging
 from typing import Awaitable, Callable, Optional
 
-from app.container import FINDINGS_DIR, WORKDIR, ContainerRunner, compute_diff, prepare_repo
-from app.harness import build_argv, harness_env
+from app.container import (
+    FINDINGS_DIR,
+    WORKDIR,
+    ContainerRunner,
+    compute_diff,
+    prepare_repo,
+    provision_harnesses,
+)
+from app.harness import build_argv, harness_env, harness_model
 from app.orm import Settings
 from app.review.models import (
     ConvergenceResult,
@@ -272,6 +279,7 @@ async def run_review(
             clone_credential_kind=settings.clone_credential_kind,
             clone_credential_secret=settings.clone_credential_secret,
         )
+        await provision_harnesses(handle, settings)
         diff = await compute_diff(handle, job)
 
         prev: dict[HarnessType, list[Finding]] = {}
@@ -307,7 +315,8 @@ async def run_review(
 
                 await handle.write_file(ppath, prompt)
                 argv = build_argv(
-                    h, workdir=WORKDIR, prompt_path=ppath, findings_path=fpath
+                    h, workdir=WORKDIR, prompt_path=ppath, findings_path=fpath,
+                    model=harness_model(h, settings),
                 )
                 exec_res = await handle.exec(argv, env=harness_env(h, settings))
                 if not exec_res.ok:

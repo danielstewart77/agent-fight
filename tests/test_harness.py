@@ -62,23 +62,48 @@ def test_parse_line_codex_message_and_error():
 
 def _settings_with_proxy() -> Settings:
     s = Settings(id=1, round_cap=3, clone_credential_kind="token")
-    s.proxy_base_url = "https://proxy.internal"
-    s.proxy_api_key = "key-abc"
+    s.claude_proxy_url = "https://proxy.internal"
+    s.claude_proxy_key = "claude-key"
+    s.codex_proxy_url = "https://proxy.internal/v1"
+    s.codex_proxy_key = "codex-key"
     return s
 
 
-def test_harness_env_claude():
+def test_harness_env_claude_has_no_auth_token():
     env = harness_env(HarnessType.CLAUDE, _settings_with_proxy())
     assert env["ANTHROPIC_BASE_URL"] == "https://proxy.internal"
-    assert env["ANTHROPIC_API_KEY"] == "key-abc"
+    assert env["ANTHROPIC_API_KEY"] == "claude-key"
+    # AUTH_TOKEN must never be set — it would route away from the proxy.
+    assert "ANTHROPIC_AUTH_TOKEN" not in env
 
 
 def test_harness_env_codex():
     env = harness_env(HarnessType.CODEX, _settings_with_proxy())
-    assert env["OPENAI_BASE_URL"] == "https://proxy.internal"
-    assert env["OPENAI_API_KEY"] == "key-abc"
+    assert env["OPENAI_BASE_URL"] == "https://proxy.internal/v1"
+    assert env["OPENAI_API_KEY"] == "codex-key"
 
 
 def test_harness_env_empty_when_proxy_unset():
     s = Settings(id=1, round_cap=3, clone_credential_kind="token")
     assert harness_env(HarnessType.CLAUDE, s) == {}
+    assert harness_env(HarnessType.CODEX, s) == {}
+
+
+def test_codex_auth_json():
+    import json
+    from app.harness import codex_auth_json
+
+    data = json.loads(codex_auth_json("codex-key"))
+    assert data == {"auth_mode": "apikey", "OPENAI_API_KEY": "codex-key"}
+
+
+def test_codex_config_toml():
+    from app.harness import codex_config_toml
+
+    toml = codex_config_toml("https://proxy.internal/v1", "gpt-5.5")
+    assert 'openai_base_url = "https://proxy.internal/v1"' in toml
+    assert 'model = "gpt-5.5"' in toml
+    assert 'model_provider = "azure_proxy"' in toml
+    assert "[model_providers.azure_proxy]" in toml
+    assert 'wire_api = "responses"' in toml
+    assert 'env_key = "OPENAI_API_KEY"' in toml
