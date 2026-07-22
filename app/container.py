@@ -58,6 +58,7 @@ class ContainerHandle(Protocol):
         *,
         env: Optional[dict[str, str]] = None,
         cwd: Optional[str] = None,
+        stdin: Optional[str] = None,
         timeout: Optional[float] = None,
     ) -> ExecResult: ...
 
@@ -79,14 +80,18 @@ class ContainerRunner(Protocol):
 # --------------------------------------------------------------------------- #
 
 
-async def _run(argv: list[str], *, timeout: Optional[float] = None) -> ExecResult:
+async def _run(
+    argv: list[str], *, stdin: Optional[str] = None, timeout: Optional[float] = None
+) -> ExecResult:
     proc = await asyncio.create_subprocess_exec(
         *argv,
+        stdin=asyncio.subprocess.PIPE if stdin is not None else None,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
+    feed = stdin.encode("utf-8") if stdin is not None else None
     try:
-        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        out, err = await asyncio.wait_for(proc.communicate(feed), timeout=timeout)
     except asyncio.TimeoutError:
         proc.kill()
         await proc.wait()
@@ -110,16 +115,19 @@ class DockerHandle:
         *,
         env: Optional[dict[str, str]] = None,
         cwd: Optional[str] = None,
+        stdin: Optional[str] = None,
         timeout: Optional[float] = None,
     ) -> ExecResult:
         cmd = ["docker", "exec"]
+        if stdin is not None:
+            cmd.append("-i")  # keep STDIN open so the prompt can be piped in
         for key, value in (env or {}).items():
             cmd += ["-e", f"{key}={value}"]
         if cwd:
             cmd += ["-w", cwd]
         cmd.append(self._cid)
         cmd += argv
-        return await _run(cmd, timeout=timeout)
+        return await _run(cmd, stdin=stdin, timeout=timeout)
 
     async def read_file(self, path: str) -> str:
         res = await self.exec(["cat", path])
@@ -273,11 +281,13 @@ class FakeHandle:
 
     files: dict[str, str] = field(default_factory=dict)
     exec_log: list[list[str]] = field(default_factory=list)
+    stdin_log: list[Optional[str]] = field(default_factory=list)
     exec_results: dict[str, ExecResult] = field(default_factory=dict)
     stopped: bool = False
 
-    async def exec(self, argv, *, env=None, cwd=None, timeout=None) -> ExecResult:
+    async def exec(self, argv, *, env=None, cwd=None, stdin=None, timeout=None) -> ExecResult:
         self.exec_log.append(list(argv))
+        self.stdin_log.append(stdin)
         key = " ".join(argv)
         for pattern, result in self.exec_results.items():
             if pattern in key:

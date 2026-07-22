@@ -130,6 +130,9 @@ async def test_run_review_early_convergence_round1():
     # Converged in round 1 — no round-2 files were ever read.
     assert handle.stopped is True          # teardown ran
     assert ado.posted == review            # posted back
+    # The prompt reached each harness via stdin (not a dropped file).
+    piped = [s for s in handle.stdin_log if s]
+    assert piped and all("findings" in s.lower() for s in piped)
 
 
 async def test_run_review_cap_hit_surfaces_disagreement():

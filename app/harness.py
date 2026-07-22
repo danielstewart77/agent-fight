@@ -53,15 +53,13 @@ def build_argv(
     harness: HarnessType,
     *,
     workdir: str,
-    prompt_path: str,
-    findings_path: str,
     model: str | None = None,
 ) -> list[str]:
     """The command to run `harness` once, non-interactively, in the container.
 
-    The prompt (read from `prompt_path`) instructs the harness to write its
-    structured findings to `findings_path`. Both run inside the sealed,
-    ephemeral review container, so Claude runs with permission prompts skipped.
+    The prompt is piped to the process on stdin (see coordinator.run_review); it
+    tells the harness where to write its findings JSON. Both run inside the
+    sealed, ephemeral review container, so Claude skips permission prompts.
     """
     if harness is HarnessType.CLAUDE:
         argv = [
@@ -78,9 +76,20 @@ def build_argv(
             argv += ["--model", model]
         return argv
     if harness is HarnessType.CODEX:
-        # --skip-git-repo-check: the clone is a git repo, but don't let Codex's
-        # trusted-directory guard abort the run.
-        argv = ["codex", "exec", "--json", "--skip-git-repo-check", "--cd", workdir]
+        # The review runs in a sealed, ephemeral container, so let Codex act
+        # autonomously (the analog of Claude's --dangerously-skip-permissions):
+        # its default read-only sandbox otherwise blocks writing the findings
+        # file, and approvals would block non-interactively. --skip-git-repo-check
+        # keeps its trusted-directory guard from aborting the run.
+        argv = [
+            "codex",
+            "exec",
+            "--json",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--skip-git-repo-check",
+            "--cd",
+            workdir,
+        ]
         if model:
             argv += ["--model", model]
         return argv

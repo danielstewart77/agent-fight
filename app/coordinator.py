@@ -48,6 +48,10 @@ from app.review.models import (
 
 logger = logging.getLogger("agent_fight.coordinator")
 
+# Per-harness wall-clock cap for a single review round (a hung CLI must not
+# block the run forever).
+HARNESS_TIMEOUT = 900.0
+
 # A reasoner turns a structured cross-exposure input into conversational prose.
 Reasoner = Callable[[str], Awaitable[str]]
 
@@ -227,10 +231,6 @@ def _findings_path(harness: HarnessType, round_no: int) -> str:
     return f"{FINDINGS_DIR}/findings-{harness.value}-round{round_no}.json"
 
 
-def _prompt_path(harness: HarnessType, round_no: int) -> str:
-    return f"{FINDINGS_DIR}/prompt-{harness.value}-round{round_no}.md"
-
-
 def _round1_prompt(diff: str, findings_path: str) -> str:
     return (
         "You are reviewing a pull request. Review the diff below independently "
@@ -291,7 +291,6 @@ async def run_review(
 
             for h in harnesses:
                 fpath = _findings_path(h, round_no)
-                ppath = _prompt_path(h, round_no)
                 if round_no == 1:
                     prompt = _round1_prompt(diff, fpath)
                 else:
@@ -313,12 +312,13 @@ async def run_review(
                         f"{framed}\n"
                     )
 
-                await handle.write_file(ppath, prompt)
-                argv = build_argv(
-                    h, workdir=WORKDIR, prompt_path=ppath, findings_path=fpath,
-                    model=harness_model(h, settings),
+                argv = build_argv(h, workdir=WORKDIR, model=harness_model(h, settings))
+                exec_res = await handle.exec(
+                    argv,
+                    env=harness_env(h, settings),
+                    stdin=prompt,
+                    timeout=HARNESS_TIMEOUT,
                 )
-                exec_res = await handle.exec(argv, env=harness_env(h, settings))
                 if not exec_res.ok:
                     logger.warning(
                         "harness %s exited rc=%s in round %s", h.value, exec_res.rc, round_no

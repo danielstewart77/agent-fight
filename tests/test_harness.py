@@ -17,23 +17,22 @@ def test_resolve_harness():
 
 
 def test_build_argv_claude():
-    argv = build_argv(
-        HarnessType.CLAUDE, workdir="/work/repo", prompt_path="/p", findings_path="/f", model="m"
-    )
+    argv = build_argv(HarnessType.CLAUDE, workdir="/work/repo", model="m")
     assert argv[0] == "claude"
     assert "stream-json" in argv
     assert "--model" in argv and "m" in argv
 
 
 def test_build_argv_codex():
-    argv = build_argv(HarnessType.CODEX, workdir="/work/repo", prompt_path="/p", findings_path="/f")
+    argv = build_argv(HarnessType.CODEX, workdir="/work/repo")
     assert argv[0] == "codex"
     assert "--json" in argv
     assert "--skip-git-repo-check" in argv
+    assert "--dangerously-bypass-approvals-and-sandbox" in argv
 
 
 def test_build_argv_claude_skips_permissions():
-    argv = build_argv(HarnessType.CLAUDE, workdir="/w", prompt_path="/p", findings_path="/f")
+    argv = build_argv(HarnessType.CLAUDE, workdir="/w")
     assert "--dangerously-skip-permissions" in argv
 
 
