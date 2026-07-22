@@ -73,12 +73,14 @@ class ProxyClient:
         api_key: str,
         *,
         model: Optional[str] = None,
+        flavor: str = "anthropic",
         client: Optional[httpx.AsyncClient] = None,
         timeout: float = 120.0,
     ) -> None:
         self._root = proxy_root(base_url)
         self._api_key = api_key
         self._model = model
+        self._flavor = flavor
         self._timeout = timeout
         self._client = client
         self._owns_client = client is None
@@ -113,11 +115,31 @@ class ProxyClient:
         model: Optional[str] = None,
         max_tokens: int = 4096,
     ) -> str:
-        """One Anthropic Messages call; returns the concatenated text blocks."""
+        """One completion in the configured flavor; returns the text.
+
+        - anthropic: POST /v1/messages, top-level `system`, parse content[].text.
+        - openai:    POST /v1/chat/completions, `system` as a system-role
+                     message, parse choices[0].message.content.
+        """
         use_model = model or self._model
         if not use_model:
             raise ProxyError("no model configured for the coordinator proxy")
-        body: dict = {"model": use_model, "max_tokens": max_tokens, "messages": messages}
+
+        if self._flavor == "openai":
+            msgs = ([{"role": "system", "content": system}] if system else []) + messages
+            body = {"model": use_model, "max_tokens": max_tokens, "messages": msgs}
+            resp = await self._http().post(
+                f"{self._root}/v1/chat/completions", headers=self._headers(), json=body
+            )
+            if resp.status_code // 100 != 2:
+                raise ProxyError(f"proxy returned {resp.status_code}: {resp.text[:500]}")
+            try:
+                data = resp.json()
+                return data["choices"][0]["message"]["content"] or ""
+            except (ValueError, KeyError, IndexError, TypeError) as exc:
+                raise ProxyError(f"malformed proxy response: {exc}") from exc
+
+        body = {"model": use_model, "max_tokens": max_tokens, "messages": messages}
         if system is not None:
             body["system"] = system
         resp = await self._http().post(
@@ -187,18 +209,18 @@ async def _settings(session: AsyncSession) -> Optional[Settings]:
     ).scalar_one_or_none()
 
 
-async def load_coordinator_proxy(session: AsyncSession) -> tuple[str, str, Optional[str]]:
-    """Return (base_url, api_key, model) for the coordinator proxy or raise."""
+async def load_coordinator_proxy(session: AsyncSession) -> tuple[str, str, Optional[str], str]:
+    """Return (base_url, api_key, model, flavor) for the coordinator proxy or raise."""
     row = await _settings(session)
     if row is None or not row.coord_proxy_url or not row.coord_proxy_key:
         raise ProxyNotConfigured(
             "coordinator proxy is not configured — set it at /admin/proxy"
         )
-    return row.coord_proxy_url, row.coord_proxy_key, row.coord_model
+    return row.coord_proxy_url, row.coord_proxy_key, row.coord_model, row.coord_flavor or "anthropic"
 
 
 async def coordinator_client_from_settings(
     session: AsyncSession, *, client: Optional[httpx.AsyncClient] = None
 ) -> ProxyClient:
-    base_url, api_key, model = await load_coordinator_proxy(session)
-    return ProxyClient(base_url, api_key, model=model, client=client)
+    base_url, api_key, model, flavor = await load_coordinator_proxy(session)
+    return ProxyClient(base_url, api_key, model=model, flavor=flavor, client=client)

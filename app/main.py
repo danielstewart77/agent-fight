@@ -32,10 +32,10 @@ async def _proxy_status() -> str:
     """'up' | 'down' | 'unconfigured' — non-fatal diagnostic of the coordinator proxy."""
     async with SessionLocal() as session:
         try:
-            base_url, api_key, model = await load_coordinator_proxy(session)
+            base_url, api_key, model, flavor = await load_coordinator_proxy(session)
         except ProxyNotConfigured:
             return "unconfigured"
-    async with ProxyClient(base_url, api_key, model=model) as pc:
+    async with ProxyClient(base_url, api_key, model=model, flavor=flavor) as pc:
         return "up" if await pc.ping() else "down"
 
 

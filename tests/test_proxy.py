@@ -57,6 +57,27 @@ async def test_complete_posts_messages_and_extracts_text():
     assert out == "hello world"
 
 
+async def test_complete_openai_flavor_uses_chat_completions():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        import json as _json
+        seen["body"] = _json.loads(request.read())
+        return httpx.Response(
+            200, json={"choices": [{"message": {"role": "assistant", "content": "hi there"}}]}
+        )
+
+    transport = httpx.MockTransport(handler)
+    http = httpx.AsyncClient(transport=transport)
+    pc = ProxyClient("https://p.example/v1", "k", flavor="openai", model="gpt-5.5", client=http)
+    out = await pc.complete(messages=[{"role": "user", "content": "hi"}], system="be nice")
+    assert out == "hi there"
+    assert seen["path"] == "/v1/chat/completions"
+    # system was folded into a leading system-role message.
+    assert seen["body"]["messages"][0] == {"role": "system", "content": "be nice"}
+
+
 async def test_complete_without_model_raises():
     import pytest as _pytest
 

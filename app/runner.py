@@ -93,7 +93,10 @@ def _proxy_reasoner(settings) -> Optional[Callable[[str], Awaitable[str]]]:
 
     async def reason(structured: str) -> str:
         async with ProxyClient(
-            settings.coord_proxy_url, settings.coord_proxy_key, model=settings.coord_model
+            settings.coord_proxy_url,
+            settings.coord_proxy_key,
+            model=settings.coord_model,
+            flavor=settings.coord_flavor or "anthropic",
         ) as pc:
             return await pc.complete(
                 system=(

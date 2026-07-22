@@ -94,6 +94,12 @@ class Settings(Base):
     coord_proxy_url: Mapped[Optional[str]] = mapped_column(Unicode(512), nullable=True)
     coord_proxy_key: Mapped[Optional[str]] = mapped_column(Unicode(2048), nullable=True)
     coord_model: Mapped[Optional[str]] = mapped_column(Unicode(128), nullable=True)
+    # Which provider protocol the coordinator speaks: 'anthropic' (Claude-style
+    # /v1/messages) or 'openai' (Codex-style /v1/chat/completions). Selected on
+    # /admin/proxy; drives both the model listing and the ProxyClient call shape.
+    coord_flavor: Mapped[str] = mapped_column(
+        Unicode(16), nullable=False, server_default="anthropic"
+    )
 
     # Clone credential the per-review container uses to pull the target
     # repo: a PAT/token or an SSH private key.
