@@ -86,6 +86,32 @@ def test_synthesize_clean_when_empty():
     assert "clean" in synthesize_final_review([], [], [])
 
 
+def test_parse_findings_reads_confidence_and_suggestion():
+    raw = json.dumps({"findings": [
+        {"file": "a.py", "line": 5, "claim": "bug", "severity": "critical",
+         "confidence": 92, "suggestion": "guard the null"},
+        {"file": "b.py", "line": 1, "claim": "x"},  # defaults
+    ]})
+    fs = parse_findings(raw)
+    assert fs[0].confidence == 92 and fs[0].suggestion == "guard the null"
+    assert fs[1].confidence == 100 and fs[1].suggestion == ""
+
+
+def test_synthesize_pr_review_format():
+    consensus = [
+        Finding("a.py", 10, "leak", severity="critical", verdict="issue",
+                confidence=95, suggestion="dispose it"),
+        Finding("b.py", 20, "nit", severity="nit", verdict="issue", confidence=80),
+    ]
+    md = synthesize_final_review(consensus, [], [], reviewed="`feat` → `main`")
+    assert "_Reviewed `feat` → `main`._" in md
+    assert "### Critical" in md and "### Nit" in md
+    # Critical group renders before Nit group.
+    assert md.index("### Critical") < md.index("### Nit")
+    assert "_(confidence 95)_" in md
+    assert "**Fix:** dispose it" in md
+
+
 # --- full loop against FakeRunner ------------------------------------------ #
 
 

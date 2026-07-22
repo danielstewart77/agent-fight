@@ -159,17 +159,40 @@ class DockerHandle:
         await _run(["docker", "rm", "-f", self._cid])
 
 
-class DockerRunner:
-    """Starts one ephemeral container per review via `docker run`."""
+def _docker_run_argv(image: str, mounts: list[tuple[str, str]]) -> list[str]:
+    """Build the `docker run` argv, adding a read-only bind mount per skill.
 
-    def __init__(self, image: str, *, run_timeout: float = 60.0) -> None:
+    Pure so it can be unit-tested without Docker (mirrors
+    frame-main/sandbox/provision.py's `-v host:container:ro`)."""
+    argv = ["docker", "run", "-d", "--rm"]
+    for host_path, container_path in mounts:
+        argv += ["-v", f"{host_path}:{container_path}:ro"]
+    argv += [image, "sleep", "infinity"]
+    return argv
+
+
+class DockerRunner:
+    """Starts one ephemeral container per review via `docker run`.
+
+    `mounts` are (host_path, container_path) pairs bind-mounted read-only — used
+    to surface the operator-selected skills at the harness's skills dir (see
+    app/skills.py::selected_skill_mounts)."""
+
+    def __init__(
+        self,
+        image: str,
+        *,
+        mounts: Optional[list[tuple[str, str]]] = None,
+        run_timeout: float = 60.0,
+    ) -> None:
         self._image = image
+        self._mounts = mounts or []
         self._run_timeout = run_timeout
 
     @asynccontextmanager
     async def start(self, job: ReviewJob) -> AsyncIterator[ContainerHandle]:
         res = await _run(
-            ["docker", "run", "-d", "--rm", self._image, "sleep", "infinity"],
+            _docker_run_argv(self._image, self._mounts),
             timeout=self._run_timeout,
         )
         if not res.ok:

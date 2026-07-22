@@ -11,7 +11,11 @@ and its PAT, the webhook shared secret, and the clone credential (token or SSH
 key). `/admin/proxy` holds the **three inference-proxy connections** — one each
 for the Claude harness, the Codex harness, and the coordinator — as base URL +
 API key + model, with the model chosen from a dropdown populated live from the
-proxy's `/models` listing. Operator accounts are managed at `/admin/users`.
+proxy's `/models` listing. `/admin/skills` clones the `claude-skills` /
+`codex-skills` repos to `SKILLS_ROOT` and lets you pick, per harness, which
+skills are bind-mounted read-only into its review container (`~/.claude/skills`
+/ `~/.codex/skills`) — the `agent-fight-review` skill instructs each harness on
+the review + findings format. Operator accounts are managed at `/admin/users`.
 
 The harnesses connect to the proxy the way the proxy's own installers do
 (mirrored from `install-claude.sh` / `install-codex.sh`): Claude via

@@ -101,6 +101,16 @@ class Settings(Base):
         Unicode(16), nullable=False, server_default="anthropic"
     )
 
+    # Agent skills. Each harness's skills repo is cloned once on the host and
+    # bind-mounted read-only into the review container (see app/skills.py). The
+    # `*_skills_enabled` columns hold a JSON list of the skill-folder names the
+    # operator selected for that harness on /admin/skills (empty = none). Repo
+    # URLs are non-secret; git auth comes from the host credential helper.
+    claude_skills_repo: Mapped[Optional[str]] = mapped_column(Unicode(512), nullable=True)
+    codex_skills_repo: Mapped[Optional[str]] = mapped_column(Unicode(512), nullable=True)
+    claude_skills_enabled: Mapped[Optional[str]] = mapped_column(UnicodeText, nullable=True)
+    codex_skills_enabled: Mapped[Optional[str]] = mapped_column(UnicodeText, nullable=True)
+
     # Clone credential the per-review container uses to pull the target
     # repo: a PAT/token or an SSH private key.
     clone_credential_kind: Mapped[str] = mapped_column(

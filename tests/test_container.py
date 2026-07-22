@@ -57,6 +57,26 @@ async def test_prepare_repo_raises_on_failed_step():
         )
 
 
+def test_docker_run_argv_adds_readonly_mounts():
+    from app.container import _docker_run_argv
+
+    argv = _docker_run_argv(
+        "img:latest",
+        [("/host/a", "/home/node/.claude/skills/a"), ("/host/b", "/home/node/.codex/skills/b")],
+    )
+    assert argv[:4] == ["docker", "run", "-d", "--rm"]
+    assert "-v" in argv
+    assert "/host/a:/home/node/.claude/skills/a:ro" in argv
+    assert "/host/b:/home/node/.codex/skills/b:ro" in argv
+    assert argv[-3:] == ["img:latest", "sleep", "infinity"]
+
+
+def test_docker_run_argv_no_mounts():
+    from app.container import _docker_run_argv
+
+    assert _docker_run_argv("img", []) == ["docker", "run", "-d", "--rm", "img", "sleep", "infinity"]
+
+
 async def test_compute_diff_returns_stdout():
     handle = FakeHandle(exec_results={"git -C /work/repo diff": ExecResult(rc=0, stdout="DIFFTEXT")})
     assert await compute_diff(handle, _job()) == "DIFFTEXT"

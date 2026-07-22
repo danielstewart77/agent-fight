@@ -60,6 +60,11 @@ class Finding:
     claim: str
     severity: str = "medium"
     verdict: str = "issue"
+    # 0-100 confidence the issue is real (pr-review-toolkit convention); items
+    # below the reporting threshold are meant to be filtered out by the harness.
+    confidence: int = 100
+    # A concrete fix suggestion, shown in the final comment.
+    suggestion: str = ""
 
 
 @dataclass(frozen=True)

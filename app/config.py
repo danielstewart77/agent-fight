@@ -21,6 +21,11 @@ class Config:
     # harness CLIs (claude, codex) installed. See app/container.py.
     review_image: str = os.getenv("REVIEW_IMAGE", "agent-fight-review:latest")
 
+    # Host directory holding one clone of each skills repo. Cloned/pulled by the
+    # admin "sync" on /admin/skills and bind-mounted read-only into review
+    # containers — see app/skills.py. The repo URLs live in DB settings.
+    skills_root: str = os.getenv("SKILLS_ROOT", str(REPO_ROOT / "data" / "skills"))
+
     # SQLite database. Single file, no server. Override with an absolute path
     # to relocate it (e.g. onto a mounted volume).
     db_path: str = os.getenv("DB_PATH", str(REPO_ROOT / "data" / "agent_fight.db"))

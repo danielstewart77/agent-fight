@@ -72,6 +72,19 @@ def test_settings_table_has_per_role_proxy_columns(tmp_path):
     assert "proxy_base_url" not in cols and "proxy_api_key" not in cols
 
 
+def test_settings_table_has_skills_columns(tmp_path):
+    """Migration 0006 adds the per-harness skills columns."""
+    db = tmp_path / "agent_fight.db"
+    _upgrade_into(db)
+    engine = create_engine(f"sqlite:///{db}")
+    try:
+        cols = {c["name"] for c in inspect(engine).get_columns("settings")}
+    finally:
+        engine.dispose()
+    assert {"claude_skills_repo", "codex_skills_repo",
+            "claude_skills_enabled", "codex_skills_enabled"} <= cols
+
+
 def test_users_table_created_with_expected_columns(tmp_path):
     """Migration 0003 adds the users table."""
     db = tmp_path / "agent_fight.db"

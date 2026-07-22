@@ -14,6 +14,7 @@ from app.admin import account as admin_account
 from app.admin import login as admin_login
 from app.admin import proxy as admin_proxy
 from app.admin import settings as admin_settings
+from app.admin import skills as admin_skills
 from app.admin import users as admin_users
 from app.auth import is_authenticated, is_redirect_exception, normalize_username
 from app.config import config
@@ -122,6 +123,7 @@ def create_app() -> FastAPI:
     app.include_router(admin_login.router)
     app.include_router(admin_settings.router)
     app.include_router(admin_proxy.router)
+    app.include_router(admin_skills.router)
     app.include_router(admin_account.router)
     app.include_router(admin_users.router)
 

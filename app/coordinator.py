@@ -94,6 +94,10 @@ def parse_findings(raw: str) -> list[Finding]:
             line = int(item.get("line", 0) or 0)
         except (TypeError, ValueError):
             line = 0
+        try:
+            confidence = int(item.get("confidence", 100) or 100)
+        except (TypeError, ValueError):
+            confidence = 100
         out.append(
             Finding(
                 file=str(file),
@@ -101,6 +105,8 @@ def parse_findings(raw: str) -> list[Finding]:
                 claim=str(claim),
                 severity=str(item.get("severity", "medium")),
                 verdict=str(item.get("verdict", "issue")),
+                confidence=max(0, min(100, confidence)),
+                suggestion=str(item.get("suggestion", "") or ""),
             )
         )
     return out
@@ -184,44 +190,75 @@ def _dedupe(findings: list[Finding]) -> list[Finding]:
     return list(seen.values())
 
 
+# Severity buckets in the order they render (unknown severities fall to the
+# end). Matches the org's house vocabulary (see the pr-code-review skill).
+_SEVERITY_ORDER = ["critical", "major", "minor", "nit"]
+
+
+def _sev_rank(severity: str) -> int:
+    s = (severity or "").strip().lower()
+    return _SEVERITY_ORDER.index(s) if s in _SEVERITY_ORDER else len(_SEVERITY_ORDER)
+
+
+def _loc(f: Finding) -> str:
+    return f"{f.file}:{f.line}" if f.line else f.file
+
+
+def _render_grouped(findings: list[Finding]) -> list[str]:
+    """Findings grouped by severity (Critical→Low), each with confidence + fix."""
+    lines: list[str] = []
+    order = sorted(findings, key=lambda f: (_sev_rank(f.severity), _key(f)))
+    current: str | None = None
+    for f in order:
+        sev = (f.severity or "medium").strip().lower()
+        if sev != current:
+            current = sev
+            lines.append("")
+            lines.append(f"### {sev.capitalize()}")
+        lines.append(f"- **{_loc(f)}** _(confidence {f.confidence})_ — {f.claim}")
+        if f.suggestion:
+            lines.append(f"  - **Fix:** {f.suggestion}")
+    return lines
+
+
 def synthesize_final_review(
     consensus: list[Finding],
     disagreements: list[Disagreement],
     unmatched: list[Finding],
+    *,
+    reviewed: str | None = None,
 ) -> str:
-    """Inclusive union write-up. No tiebreak: agreed items, every distinct
-    unresolved concern, and each disagreement surfaced explicitly."""
-    lines: list[str] = ["# Code Review", ""]
+    """Inclusive union write-up in the pr-review format: a "reviewed" header,
+    findings grouped by severity with confidence + a concrete fix, agreed items
+    first, then disagreements surfaced explicitly, then one-reviewer concerns.
+    No tiebreak."""
+    lines: list[str] = ["# Code Review"]
+    if reviewed:
+        lines.append(f"_Reviewed {reviewed}._")
 
     agreed = _dedupe(consensus)
     if agreed:
+        lines.append("")
         lines.append("## Agreed findings")
-        lines.append("")
-        for f in sorted(agreed, key=_key):
-            loc = f"{f.file}:{f.line}" if f.line else f.file
-            lines.append(f"- **[{f.severity}] {loc}** — {f.claim}")
-        lines.append("")
+        lines += _render_grouped(agreed)
 
     if disagreements:
+        lines.append("")
         lines.append("## Unresolved disagreements")
         lines.append("")
         for d in sorted(disagreements, key=lambda x: (x.file, x.line)):
-            loc = f"{d.file}:{d.line}" if d.line else d.file
             lines.append(
-                f"- **{loc}** — {d.left.claim} "
+                f"- **{_loc(d.left)}** — {d.left.claim} "
                 f"(agent 1: `{d.left.verdict}`, agent 2: `{d.right.verdict}`)"
             )
-        lines.append("")
 
     if unmatched:
+        lines.append("")
         lines.append("## Additional concerns (raised by one reviewer)")
-        lines.append("")
-        for f in sorted(unmatched, key=_key):
-            loc = f"{f.file}:{f.line}" if f.line else f.file
-            lines.append(f"- **[{f.severity}] {loc}** — {f.claim}")
-        lines.append("")
+        lines += _render_grouped(unmatched)
 
     if not (agreed or disagreements or unmatched):
+        lines.append("")
         lines.append("_No findings — both reviewers reported the change as clean._")
 
     return "\n".join(lines).rstrip() + "\n"
@@ -234,10 +271,14 @@ def _findings_path(harness: HarnessType, round_no: int) -> str:
 def _round1_prompt(diff: str, findings_path: str) -> str:
     return (
         "You are reviewing a pull request. Review the diff below independently "
-        "and thoroughly.\n\n"
-        f"Write your findings as JSON to {findings_path} — a list of objects, "
-        'each {"file","line","claim","severity","verdict":"issue"}. '
-        "severity is one of low|medium|high|critical.\n\n"
+        "and thoroughly. If you have the agent-fight-review skill, follow it.\n\n"
+        f"Write your findings as JSON to {findings_path} — a list of objects, each "
+        '{"file","line","claim","severity","confidence","suggestion","verdict":"issue"}. '
+        "severity is one of critical|major|minor|nit; confidence is 0-100 (only "
+        "report issues you are >=80 confident are real); suggestion is a concrete "
+        "fix. Review across the nine dimensions (correctness, readability, "
+        "simplicity, consistency, maintainability, test coverage, error handling, "
+        "performance, security). Prefer few high-signal findings over nitpicks.\n\n"
         f"Full repo is at {WORKDIR}; read any file you need for context.\n\n"
         "--- DIFF ---\n"
         f"{diff}\n"
@@ -337,7 +378,8 @@ async def run_review(
                 break
 
         review_md = synthesize_final_review(
-            consensus, result.disagreements, result.unmatched
+            consensus, result.disagreements, result.unmatched,
+            reviewed=f"`{job.source_branch}` → `{job.target_branch}`",
         )
 
     if post_back and ado_client is not None:

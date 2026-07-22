@@ -68,13 +68,16 @@ async def _default_run(job: ReviewJob) -> None:
             logger.error("no settings row; cannot run review for PR %s", job.pr_id)
             return
 
+        from app import skills as skills_mod
+
         reasoner = _proxy_reasoner(settings)
         ado_client = AdoClient()
+        mounts = skills_mod.selected_skill_mounts(settings)
         try:
             await run_review(
                 job,
                 settings,
-                runner=DockerRunner(config.review_image),
+                runner=DockerRunner(config.review_image, mounts=mounts),
                 ado_client=ado_client,
                 reasoner=reasoner,
             )
