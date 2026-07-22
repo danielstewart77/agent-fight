@@ -1,4 +1,4 @@
-# agent-fight
+# Agent🥊🤖🥊Fight
 
 A FastAPI web service that runs a multi-agent code-review consensus loop:
 independent harnesses (Claude, Codex, ...) review the same Azure DevOps pull
