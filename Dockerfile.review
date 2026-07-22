@@ -6,20 +6,26 @@
 # It needs git + node/npm + both harness CLIs. It does NOT run the agent-fight
 # web app itself.
 #
+# Runs as the non-root `node` user (uid 1000, ships with the node image):
+# Claude Code refuses --dangerously-skip-permissions when running as root.
+#
 # Build:  docker build -f Dockerfile.review -t agent-fight-review:latest .
 FROM node:20-bookworm-slim
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git ca-certificates \
+    && apt-get install -y --no-install-recommends git ca-certificates bubblewrap \
     && rm -rf /var/lib/apt/lists/*
 
-# Both harness CLIs, installed globally.
+# Both harness CLIs, installed globally (as root, before dropping privileges).
 RUN npm install -g @anthropic-ai/claude-code @openai/codex \
     && npm cache clean --force
 
-# HOME must be set: Codex reads ~/.codex/{auth.json,config.toml}, which the app
-# writes at provision time (app/container.py). WORKDIR is where the repo clones.
-ENV HOME=/root
+# /work is the clone target; the non-root user must own it. Codex reads
+# ~/.codex/{auth.json,config.toml}, which the app writes at provision time
+# (app/container.py) under this user's HOME.
+RUN mkdir -p /work && chown -R node:node /work
+ENV HOME=/home/node
 WORKDIR /work
+USER node
 
 CMD ["sleep", "infinity"]

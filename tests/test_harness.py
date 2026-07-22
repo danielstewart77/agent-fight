@@ -29,6 +29,12 @@ def test_build_argv_codex():
     argv = build_argv(HarnessType.CODEX, workdir="/work/repo", prompt_path="/p", findings_path="/f")
     assert argv[0] == "codex"
     assert "--json" in argv
+    assert "--skip-git-repo-check" in argv
+
+
+def test_build_argv_claude_skips_permissions():
+    argv = build_argv(HarnessType.CLAUDE, workdir="/w", prompt_path="/p", findings_path="/f")
+    assert "--dangerously-skip-permissions" in argv
 
 
 def test_parse_line_blank_returns_none():
@@ -77,10 +83,27 @@ def test_harness_env_claude_has_no_auth_token():
     assert "ANTHROPIC_AUTH_TOKEN" not in env
 
 
-def test_harness_env_codex():
+def test_harness_env_codex_normalizes_to_v1():
     env = harness_env(HarnessType.CODEX, _settings_with_proxy())
     assert env["OPENAI_BASE_URL"] == "https://proxy.internal/v1"
     assert env["OPENAI_API_KEY"] == "codex-key"
+
+
+def test_harness_env_codex_appends_v1_to_bare_url():
+    from app.orm import Settings
+
+    s = Settings(id=1, round_cap=3, clone_credential_kind="token")
+    s.codex_proxy_url = "https://proxy.internal"  # bare, no /v1
+    s.codex_proxy_key = "k"
+    assert harness_env(HarnessType.CODEX, s)["OPENAI_BASE_URL"] == "https://proxy.internal/v1"
+
+
+def test_codex_base_url_normalizes():
+    from app.harness import codex_base_url
+
+    assert codex_base_url("https://p.example") == "https://p.example/v1"
+    assert codex_base_url("https://p.example/v1") == "https://p.example/v1"
+    assert codex_base_url("https://p.example/") == "https://p.example/v1"
 
 
 def test_harness_env_empty_when_proxy_unset():

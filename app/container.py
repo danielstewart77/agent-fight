@@ -31,8 +31,10 @@ logger = logging.getLogger("agent_fight.container")
 
 WORKDIR = "/work/repo"
 FINDINGS_DIR = "/work/findings"
-# HOME in the review image (Dockerfile.review). Codex reads its config here.
-CONTAINER_HOME = "/root"
+# HOME in the review image (Dockerfile.review), where Codex reads its config.
+# The image runs as the non-root `node` user (Claude refuses
+# --dangerously-skip-permissions as root).
+CONTAINER_HOME = "/home/node"
 
 
 @dataclass
@@ -236,7 +238,7 @@ async def provision_harnesses(handle: ContainerHandle, settings) -> None:
     ~/.codex/auth.json and ~/.codex/config.toml on every call, so those must
     exist before `codex` runs. Skipped for Codex when its proxy is unconfigured.
     """
-    from app.harness import codex_auth_json, codex_config_toml
+    from app.harness import codex_auth_json, codex_base_url, codex_config_toml
 
     if settings.codex_proxy_url and settings.codex_proxy_key:
         await handle.write_file(
@@ -245,7 +247,7 @@ async def provision_harnesses(handle: ContainerHandle, settings) -> None:
         )
         await handle.write_file(
             f"{CONTAINER_HOME}/.codex/config.toml",
-            codex_config_toml(settings.codex_proxy_url, settings.codex_model),
+            codex_config_toml(codex_base_url(settings.codex_proxy_url), settings.codex_model),
         )
 
 

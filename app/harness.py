@@ -25,9 +25,19 @@ from __future__ import annotations
 import json
 
 from app.orm import Settings
+from app.proxy import proxy_root
 from app.review.models import Event, HarnessType
 
 CODEX_PROVIDER_ID = "azure_proxy"
+
+
+def codex_base_url(url: str) -> str:
+    """Codex talks to the OpenAI-compatible surface at the proxy's /v1 root.
+
+    Normalize whatever the operator entered (bare root or /v1-suffixed) to a
+    single canonical `<root>/v1`, so a bare URL doesn't route Codex at the wrong
+    path (see install-codex.sh, which sets PROXY_URL with /v1)."""
+    return proxy_root(url) + "/v1"
 
 
 def resolve_harness(name: str) -> HarnessType:
@@ -68,7 +78,9 @@ def build_argv(
             argv += ["--model", model]
         return argv
     if harness is HarnessType.CODEX:
-        argv = ["codex", "exec", "--json", "--cd", workdir]
+        # --skip-git-repo-check: the clone is a git repo, but don't let Codex's
+        # trusted-directory guard abort the run.
+        argv = ["codex", "exec", "--json", "--skip-git-repo-check", "--cd", workdir]
         if model:
             argv += ["--model", model]
         return argv
@@ -142,7 +154,7 @@ def harness_env(harness: HarnessType, settings: Settings) -> dict[str, str]:
         url, key = settings.codex_proxy_url, settings.codex_proxy_key
         if not url or not key:
             return {}
-        return {"OPENAI_BASE_URL": url, "OPENAI_API_KEY": key}
+        return {"OPENAI_BASE_URL": codex_base_url(url), "OPENAI_API_KEY": key}
     raise ValueError(f"unknown harness: {harness!r}")
 
 
