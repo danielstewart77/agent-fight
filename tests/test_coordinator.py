@@ -135,8 +135,9 @@ class _RecordingAdo:
     def __init__(self):
         self.posted = None
 
-    async def post_pr_review(self, settings, job, review_md):
+    async def post_or_update_pr_review(self, settings, job, review_md):
         self.posted = review_md
+        return "created"
 
 
 async def test_run_review_early_convergence_round1():

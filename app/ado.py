@@ -24,6 +24,14 @@ from app.review.models import ReviewJob
 SUPPORTED_EVENTS = ("git.pullrequest.created", "git.pullrequest.updated")
 ADO_API_VERSION = "7.1"
 
+# Prepended to every posted review; its first line is also the marker used to
+# find our own thread on a re-review so we update it instead of duplicating.
+REVIEW_MARKER = "Agent-fight consensus review"
+REVIEW_HEADER = (
+    f"🤖 **{REVIEW_MARKER}** — Claude + Codex reviewed this PR independently "
+    "and debated to convergence.\n\n"
+)
+
 
 class UnsupportedEvent(ValueError):
     """The payload is well-formed but not a PR event we act on."""
@@ -121,31 +129,66 @@ class AdoClient:
         token = base64.b64encode(f":{pat}".encode()).decode()
         return f"Basic {token}"
 
-    async def post_pr_review(self, settings: Settings, job: ReviewJob, review_markdown: str) -> None:
-        if not settings.ado_pat:
-            raise AdoNotConfigured("ado_pat is not configured — set it at /admin/settings")
-
-        url = (
+    def _threads_url(self, job: ReviewJob, suffix: str = "") -> str:
+        return (
             f"https://dev.azure.com/{job.organization}/{job.project}"
             f"/_apis/git/repositories/{job.repo_id}"
-            f"/pullRequests/{job.pr_id}/threads?api-version={ADO_API_VERSION}"
+            f"/pullRequests/{job.pr_id}/threads{suffix}?api-version={ADO_API_VERSION}"
         )
+
+    def _headers(self, settings: Settings) -> dict[str, str]:
+        return {
+            "Authorization": self._basic_auth(settings.ado_pat),
+            "content-type": "application/json",
+        }
+
+    async def post_pr_review(self, settings: Settings, job: ReviewJob, review_markdown: str) -> None:
+        """Create a new PR thread with the review (with the header/marker)."""
+        if not settings.ado_pat:
+            raise AdoNotConfigured("ado_pat is not configured — set it at /admin/settings")
         body = {
             "comments": [
-                {"parentCommentId": 0, "content": review_markdown, "commentType": 1}
+                {"parentCommentId": 0, "content": REVIEW_HEADER + review_markdown, "commentType": 1}
             ],
             "status": 1,
         }
         resp = await self._http().post(
-            url,
-            headers={
-                "Authorization": self._basic_auth(settings.ado_pat),
-                "content-type": "application/json",
-            },
-            json=body,
+            self._threads_url(job), headers=self._headers(settings), json=body
         )
         if resp.status_code // 100 != 2:
             raise RuntimeError(f"ADO thread post failed {resp.status_code}: {resp.text[:500]}")
+
+    async def _find_our_thread(self, settings: Settings, job: ReviewJob) -> tuple[int, int] | None:
+        """(thread_id, comment_id) of our prior review thread, by marker, or None."""
+        resp = await self._http().get(self._threads_url(job), headers=self._headers(settings))
+        if resp.status_code // 100 != 2:
+            raise RuntimeError(f"ADO thread list failed {resp.status_code}: {resp.text[:300]}")
+        for thread in resp.json().get("value", []):
+            for comment in thread.get("comments", []):
+                if REVIEW_MARKER in (comment.get("content") or ""):
+                    return thread["id"], comment["id"]
+        return None
+
+    async def post_or_update_pr_review(
+        self, settings: Settings, job: ReviewJob, review_markdown: str
+    ) -> str:
+        """Update our existing review thread if present, else create one.
+
+        Returns "updated" or "created". Keeps a PR to a single, evolving review
+        comment across re-runs rather than a pile of duplicates."""
+        if not settings.ado_pat:
+            raise AdoNotConfigured("ado_pat is not configured — set it at /admin/settings")
+        found = await self._find_our_thread(settings, job)
+        content = REVIEW_HEADER + review_markdown
+        if found is None:
+            await self.post_pr_review(settings, job, review_markdown)
+            return "created"
+        thread_id, comment_id = found
+        url = self._threads_url(job, suffix=f"/{thread_id}/comments/{comment_id}")
+        resp = await self._http().patch(url, headers=self._headers(settings), json={"content": content})
+        if resp.status_code // 100 != 2:
+            raise RuntimeError(f"ADO comment update failed {resp.status_code}: {resp.text[:500]}")
+        return "updated"
 
     async def aclose(self) -> None:
         if self._client is not None and self._owns_client:

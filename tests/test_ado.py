@@ -88,6 +88,39 @@ async def test_post_pr_review_builds_correct_request():
     assert "looks good" in captured["body"]
 
 
+async def test_post_or_update_updates_existing_thread():
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, str(request.url)))
+        if request.method == "GET":
+            # An existing thread carrying our marker.
+            return httpx.Response(200, json={"value": [
+                {"id": 7, "comments": [{"id": 3, "content": "🤖 Agent-fight consensus review — old"}]}
+            ]})
+        return httpx.Response(200, json={})  # PATCH
+
+    job = parse_pull_request_event(sample_ado_payload(), _settings())
+    client = AdoClient(client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    outcome = await client.post_or_update_pr_review(_settings(ado_pat="p"), job, "new review")
+    assert outcome == "updated"
+    methods = [m for m, _ in calls]
+    assert methods == ["GET", "PATCH"]
+    assert "/threads/7/comments/3" in calls[1][1]
+
+
+async def test_post_or_update_creates_when_absent():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json={"value": []})  # no prior thread
+        return httpx.Response(200, json={"id": 1})  # POST create
+
+    job = parse_pull_request_event(sample_ado_payload(), _settings())
+    client = AdoClient(client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    outcome = await client.post_or_update_pr_review(_settings(ado_pat="p"), job, "new review")
+    assert outcome == "created"
+
+
 async def test_post_pr_review_without_pat_raises():
     job = parse_pull_request_event(sample_ado_payload(), _settings())
     client = AdoClient(client=httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200))))

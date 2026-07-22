@@ -383,6 +383,6 @@ async def run_review(
         )
 
     if post_back and ado_client is not None:
-        await ado_client.post_pr_review(settings, job, review_md)
+        await ado_client.post_or_update_pr_review(settings, job, review_md)
 
     return review_md
