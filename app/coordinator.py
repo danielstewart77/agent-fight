@@ -112,16 +112,33 @@ def parse_findings(raw: str) -> list[Finding]:
     return out
 
 
-# Verdicts that mean "this side no longer considers it an open issue".
-_CLOSED_VERDICTS = {"resolved", "agree"}
+# A verdict "affirms" the finding is a real issue. `agree`/`revised` are how a
+# reviewer signals agreement in a later round, so they count as affirming — not
+# as a disagreement just because the string differs from `issue`. `disagree`
+# and `resolved` mean the reviewer does NOT consider it an open issue.
+_AFFIRMING = {"issue", "agree", "revised"}
+
+
+def _affirms(f: Finding) -> bool:
+    return (f.verdict or "").strip().lower() in _AFFIRMING
+
+
+def _richer(a: Finding, b: Finding) -> Finding:
+    """Pick the more useful of two findings at the same location for display —
+    prefer one with a concrete fix, else the longer claim."""
+    if bool(a.suggestion) != bool(b.suggestion):
+        return a if a.suggestion else b
+    return a if len(a.claim) >= len(b.claim) else b
 
 
 def convergence(left: list[Finding], right: list[Finding]) -> ConvergenceResult:
-    """Diff two harnesses' latest findings by (file, line).
+    """Diff two harnesses' latest findings by (file, line), by whether each side
+    affirms the issue (see `_AFFIRMING`):
 
-    - Both raised the same location with the same verdict -> converged.
-    - Both raised it with differing verdicts -> disagreement (both kept).
-    - Only one side raised it -> unmatched (an unresolved concern).
+    - both affirm -> converged (an agreed finding);
+    - both negate (`resolved`/`disagree`) -> agreed non-issue, surfaced nowhere;
+    - one affirms, one negates -> disagreement (both kept);
+    - only one side raised it and affirms -> unmatched (a one-reviewer concern).
     """
     left_by = {_key(f): f for f in left}
     right_by = {_key(f): f for f in right}
@@ -134,14 +151,19 @@ def convergence(left: list[Finding], right: list[Finding]) -> ConvergenceResult:
         lf = left_by.get(key)
         rf = right_by.get(key)
         if lf and rf:
-            if lf.verdict == rf.verdict:
-                converged.append(lf)
+            la, ra = _affirms(lf), _affirms(rf)
+            if la and ra:
+                converged.append(_richer(lf, rf))
+            elif not la and not ra:
+                continue  # both agree it is not an issue — nothing to report
             else:
                 disagreements.append(
                     Disagreement(file=key[0], line=key[1], left=lf, right=rf)
                 )
         else:
-            unmatched.append(lf or rf)  # type: ignore[arg-type]
+            only = lf or rf
+            if _affirms(only):  # a resolved/withdrawn one-sided item drops out
+                unmatched.append(only)
 
     return ConvergenceResult(
         converged=converged, disagreements=disagreements, unmatched=unmatched

@@ -66,6 +66,47 @@ def test_convergence_fully_converged():
     assert convergence(f, list(f)).fully_converged
 
 
+def test_convergence_agree_and_revised_count_as_agreement():
+    left = [
+        Finding("a.py", 10, "bug", verdict="issue"),
+        Finding("b.py", 20, "smell", verdict="issue"),
+    ]
+    right = [
+        Finding("a.py", 10, "bug", verdict="agree"),      # agreement, not a clash
+        Finding("b.py", 20, "smell", verdict="revised"),  # also affirming
+    ]
+    r = convergence(left, right)
+    assert {f.file for f in r.converged} == {"a.py", "b.py"}
+    assert r.disagreements == []
+
+
+def test_convergence_both_resolved_reports_nothing():
+    left = [Finding("a.py", 1, "x", verdict="resolved")]
+    right = [Finding("a.py", 1, "x", verdict="resolved")]
+    r = convergence(left, right)
+    assert r.converged == [] and r.disagreements == [] and r.unmatched == []
+
+
+def test_convergence_issue_vs_resolved_is_disagreement():
+    left = [Finding("a.py", 1, "x", verdict="issue")]
+    right = [Finding("a.py", 1, "x", verdict="resolved")]
+    assert len(convergence(left, right).disagreements) == 1
+
+
+def test_convergence_one_sided_resolved_drops():
+    left = [Finding("a.py", 1, "x", verdict="resolved")]
+    r = convergence(left, [])
+    assert r.unmatched == []  # a withdrawn one-sided item is not surfaced
+
+
+def test_convergence_richer_finding_kept():
+    left = [Finding("a.py", 1, "short", verdict="issue")]
+    right = [Finding("a.py", 1, "much longer explanation", verdict="agree",
+                     suggestion="do the thing")]
+    conv = convergence(left, right).converged
+    assert conv[0].suggestion == "do the thing"
+
+
 def test_synthesize_surfaces_all_sections():
     consensus = [Finding("a.py", 10, "agreed bug", severity="high", verdict="issue")]
     disagreements = convergence(
