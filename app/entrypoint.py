@@ -23,7 +23,7 @@ from sqlalchemy import create_engine, inspect
 
 from app.config import config, database_url
 
-APP_TABLES = {"settings"}
+APP_TABLES = {"settings", "users"}
 
 
 def _alembic_config() -> AlembicConfig:

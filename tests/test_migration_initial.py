@@ -53,6 +53,52 @@ def test_settings_table_has_expected_columns(tmp_path):
     assert EXPECTED_SETTINGS_COLUMNS <= cols
 
 
+def test_settings_table_has_per_role_proxy_columns(tmp_path):
+    """Migration 0004 replaces the generic proxy columns with per-role ones."""
+    db = tmp_path / "agent_fight.db"
+    _upgrade_into(db)
+    engine = create_engine(f"sqlite:///{db}")
+    try:
+        cols = {c["name"] for c in inspect(engine).get_columns("settings")}
+    finally:
+        engine.dispose()
+    per_role = {
+        f"{role}_{suffix}"
+        for role in ("claude", "codex", "coord")
+        for suffix in ("proxy_url", "proxy_key", "model")
+    }
+    assert per_role <= cols
+    # The old generic columns are gone.
+    assert "proxy_base_url" not in cols and "proxy_api_key" not in cols
+
+
+def test_settings_table_has_skills_columns(tmp_path):
+    """Migration 0006 adds the per-harness skills columns."""
+    db = tmp_path / "agent_fight.db"
+    _upgrade_into(db)
+    engine = create_engine(f"sqlite:///{db}")
+    try:
+        cols = {c["name"] for c in inspect(engine).get_columns("settings")}
+    finally:
+        engine.dispose()
+    assert {"claude_skills_repo", "codex_skills_repo",
+            "claude_skills_enabled", "codex_skills_enabled"} <= cols
+
+
+def test_users_table_created_with_expected_columns(tmp_path):
+    """Migration 0003 adds the users table."""
+    db = tmp_path / "agent_fight.db"
+    _upgrade_into(db)
+    engine = create_engine(f"sqlite:///{db}")
+    try:
+        tables = set(inspect(engine).get_table_names())
+        cols = {c["name"] for c in inspect(engine).get_columns("users")} if "users" in tables else set()
+    finally:
+        engine.dispose()
+    assert "users" in tables
+    assert {"id", "username", "password_hash", "created_at", "updated_at"} <= cols
+
+
 def test_migration_does_not_insert_the_singleton_row(tmp_path):
     """Schema-only migration — the id=1 row is created lazily by the app."""
     db = tmp_path / "agent_fight.db"

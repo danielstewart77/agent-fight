@@ -1,0 +1,63 @@
+{% extends "_base.html" %}
+{% block title %}Users — Agent Fight{% endblock %}
+{% block content %}
+<h1>Users</h1>
+<p>Operator accounts. Everyone listed here is a full operator: they can log in,
+   change settings, and manage users. Deleting the last remaining user is not
+   allowed.</p>
+
+{% if error %}<div class="card error">{{ error }}</div>{% endif %}
+
+<div class="card">
+  <table>
+    <thead>
+      <tr><th>Username</th><th>Created</th><th>Reset password</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for u in users %}
+      <tr>
+        <td>{{ u.username }}{% if u.username == request.session.get('uname') %} <span class="ok">(you)</span>{% endif %}</td>
+        <td>{{ u.created_at.strftime('%Y-%m-%d %H:%M') if u.created_at else '' }}</td>
+        <td>
+          <form method="post" action="/admin/users/{{ u.id }}/password"
+                style="display:flex; gap:8px; align-items:center;">
+            <input type="password" name="password" placeholder="new password"
+                   autocomplete="new-password" minlength="8" required style="width:auto; flex:1;">
+            <input type="password" name="confirm" placeholder="confirm"
+                   autocomplete="new-password" minlength="8" required style="width:auto; flex:1;">
+            <button type="submit">Set</button>
+          </form>
+        </td>
+        <td>
+          <form method="post" action="/admin/users/{{ u.id }}/delete"
+                onsubmit="return confirm('Delete user {{ u.username }}?');">
+            <button type="submit" style="background:var(--danger);">Delete</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<h2>Add a user</h2>
+<div class="card" style="max-width: 480px;">
+  <form method="post" action="/admin/users">
+    <label for="username">Username</label>
+    <input type="text" id="username" name="username"
+           placeholder="lowercase, digits, . _ -" required>
+
+    <label for="password">Password</label>
+    <input type="password" id="password" name="password"
+           autocomplete="new-password" minlength="8" required>
+
+    <label for="confirm">Confirm password</label>
+    <input type="password" id="confirm" name="confirm"
+           autocomplete="new-password" minlength="8" required>
+
+    <div class="form-footer">
+      <button type="submit">Add user</button>
+    </div>
+  </form>
+</div>
+{% endblock %}

@@ -22,14 +22,40 @@ class Base(DeclarativeBase):
     """Base class for all ORM models. UTC datetimes throughout."""
 
 
+class User(Base):
+    """An operator account. Flat model — every user is a full operator: they
+    can log in, edit settings, and manage other users. There is no role column.
+
+    `username` is stored normalized (lowercase, trimmed) and is unique.
+    `password_hash` is a bcrypt hash (see app/security.py) — never a plaintext
+    password. The first user is seeded from the ADMIN_USERNAME/ADMIN_PASSWORD
+    env vars on startup when the table is empty (see app/main.py); after that,
+    accounts are managed entirely in-app and env is break-glass only.
+    """
+
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    username: Mapped[str] = mapped_column(Unicode(256), nullable=False, unique=True)
+    password_hash: Mapped[str] = mapped_column(Unicode(255), nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
 class Settings(Base):
     """Singleton row (id is always 1) holding the admin-configured run settings.
 
-    Secrets (`ado_pat`, `webhook_secret`, `clone_credential_secret`) are
-    stored the same way inference-proxy stores API keys: DB-backed and off
-    the filesystem, plaintext-in-DB (not a repo file) — not full
-    encryption-at-rest. The admin console never echoes a stored secret back;
-    a blank field on save leaves it untouched (see app/admin/settings.py).
+    Secrets (`ado_pat`, `webhook_secret`, `clone_credential_secret`, and the
+    per-role `*_proxy_key` columns) are stored the same way inference-proxy
+    stores API keys:
+    DB-backed and off the filesystem, plaintext-in-DB (not a repo file) — not
+    full encryption-at-rest. The admin console never echoes a stored secret
+    back; a blank field on save leaves it untouched (see app/admin/settings.py).
     """
 
     __tablename__ = "settings"
@@ -49,6 +75,41 @@ class Settings(Base):
 
     # Shared secret used to authenticate inbound ADO webhook calls.
     webhook_secret: Mapped[Optional[str]] = mapped_column(Unicode(512), nullable=True)
+
+    # Per-role inference-proxy connections. Each of the two harnesses and the
+    # coordinator has its own base URL, API key (write-only secret), and model,
+    # configured at /admin/proxy. They differ in practice: the Claude harness
+    # and coordinator speak the Anthropic Messages API (bare-root base URL),
+    # while Codex is OpenAI-compatible (base URL with /v1) and also needs its
+    # config written to files in the container (see app/harness.py). Models are
+    # picked from the proxy's /models listing.
+    claude_proxy_url: Mapped[Optional[str]] = mapped_column(Unicode(512), nullable=True)
+    claude_proxy_key: Mapped[Optional[str]] = mapped_column(Unicode(2048), nullable=True)
+    claude_model: Mapped[Optional[str]] = mapped_column(Unicode(128), nullable=True)
+
+    codex_proxy_url: Mapped[Optional[str]] = mapped_column(Unicode(512), nullable=True)
+    codex_proxy_key: Mapped[Optional[str]] = mapped_column(Unicode(2048), nullable=True)
+    codex_model: Mapped[Optional[str]] = mapped_column(Unicode(128), nullable=True)
+
+    coord_proxy_url: Mapped[Optional[str]] = mapped_column(Unicode(512), nullable=True)
+    coord_proxy_key: Mapped[Optional[str]] = mapped_column(Unicode(2048), nullable=True)
+    coord_model: Mapped[Optional[str]] = mapped_column(Unicode(128), nullable=True)
+    # Which provider protocol the coordinator speaks: 'anthropic' (Claude-style
+    # /v1/messages) or 'openai' (Codex-style /v1/chat/completions). Selected on
+    # /admin/proxy; drives both the model listing and the ProxyClient call shape.
+    coord_flavor: Mapped[str] = mapped_column(
+        Unicode(16), nullable=False, server_default="anthropic"
+    )
+
+    # Agent skills. Each harness's skills repo is cloned once on the host and
+    # bind-mounted read-only into the review container (see app/skills.py). The
+    # `*_skills_enabled` columns hold a JSON list of the skill-folder names the
+    # operator selected for that harness on /admin/skills (empty = none). Repo
+    # URLs are non-secret; git auth comes from the host credential helper.
+    claude_skills_repo: Mapped[Optional[str]] = mapped_column(Unicode(512), nullable=True)
+    codex_skills_repo: Mapped[Optional[str]] = mapped_column(Unicode(512), nullable=True)
+    claude_skills_enabled: Mapped[Optional[str]] = mapped_column(UnicodeText, nullable=True)
+    codex_skills_enabled: Mapped[Optional[str]] = mapped_column(UnicodeText, nullable=True)
 
     # Clone credential the per-review container uses to pull the target
     # repo: a PAT/token or an SSH private key.

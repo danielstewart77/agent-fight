@@ -1,0 +1,35 @@
+# Per-review container image (agent-fight-review:latest).
+#
+# One ephemeral container per PR review runs here: the app clones the repo into
+# /work, provisions each harness's proxy config (see app/container.py::
+# provision_harnesses + app/harness.py), and runs the Claude and Codex CLIs.
+# It needs git + node/npm + both harness CLIs. It does NOT run the agent-fight
+# web app itself.
+#
+# Runs as the non-root `node` user (uid 1000, ships with the node image):
+# Claude Code refuses --dangerously-skip-permissions when running as root.
+#
+# Build:  docker build -f Dockerfile.review -t agent-fight-review:latest .
+FROM node:20-bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates bubblewrap \
+    && rm -rf /var/lib/apt/lists/*
+
+# Both harness CLIs, installed globally (as root, before dropping privileges).
+RUN npm install -g @anthropic-ai/claude-code @openai/codex \
+    && npm cache clean --force
+
+# /work is the clone target; the non-root user must own it. Codex reads
+# ~/.codex/{auth.json,config.toml}, which the app writes at provision time
+# (app/container.py) under this user's HOME. Pre-create the skills dirs
+# node-owned so a read-only skill bind-mount into ~/.claude/skills or
+# ~/.codex/skills doesn't leave docker creating a root-owned parent that then
+# blocks the node user from writing auth.json/config.toml.
+RUN mkdir -p /work /home/node/.claude/skills /home/node/.codex/skills \
+    && chown -R node:node /work /home/node/.claude /home/node/.codex
+ENV HOME=/home/node
+WORKDIR /work
+USER node
+
+CMD ["sleep", "infinity"]

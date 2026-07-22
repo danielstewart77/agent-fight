@@ -1,0 +1,75 @@
+{% extends "_base.html" %}
+{% block title %}Proxy — Agent Fight{% endblock %}
+{% block content %}
+<h1>Inference proxy</h1>
+<p>Each harness and the coordinator connects to the proxy independently, and
+   each is registered in two steps (the model list can only be fetched once the
+   proxy has a key):</p>
+<ol style="color:var(--muted);">
+  <li><strong>Step 1</strong> — enter the base URL and API key, then <strong>Save</strong>.</li>
+  <li><strong>Step 2</strong> — the page reloads with the models that key can
+      reach; pick one and <strong>Save</strong> again.</li>
+</ol>
+<p style="color:var(--muted);">Base URLs may be the bare root or include
+   <code>/v1</code>. API keys are write-only; leave blank to keep the current
+   value.</p>
+
+{% for b in blocks %}
+<div class="card" style="max-width: 640px;">
+  <form method="post" action="/admin/proxy/{{ b.role }}">
+    <h2 style="margin-top:0; color:var(--fg);">{{ b.label }}</h2>
+
+    {% if b.selectable_flavor %}
+    <label for="{{ b.role }}_flavor">Provider</label>
+    <select id="{{ b.role }}_flavor" name="flavor">
+      {% for f in flavors %}
+      <option value="{{ f }}" {% if f == b.flavor %}selected{% endif %}>
+        {{ "Claude / Anthropic (/v1/messages)" if f == "anthropic" else "Codex / OpenAI (/v1/chat/completions)" }}
+      </option>
+      {% endfor %}
+    </select>
+    <p style="color:var(--muted); margin:4px 0 0;">Changing the provider changes
+       which models are listed below — save, then reload.</p>
+    {% endif %}
+
+    <label for="{{ b.role }}_proxy_url">Base URL</label>
+    <input type="text" id="{{ b.role }}_proxy_url" name="proxy_url"
+           value="{{ b.url }}" placeholder="e.g. https://ulmaiproxy.utsystem.edu">
+
+    <label for="{{ b.role }}_proxy_key">API key <span style="color:var(--muted);">({% if b.key_set %}set{% else %}not set{% endif %})</span></label>
+    <input type="password" id="{{ b.role }}_proxy_key" name="proxy_key"
+           autocomplete="new-password" placeholder="leave blank to keep current value">
+
+    <label for="{{ b.role }}_model">Model</label>
+    {% if b.options %}
+    <select id="{{ b.role }}_model" name="model">
+      <option value="">— select a model —</option>
+      {% for m in b.options %}
+      <option value="{{ m }}" {% if m == b.model %}selected{% endif %}>{{ m }}</option>
+      {% endfor %}
+      {% if b.model and b.model not in b.options %}
+      <option value="{{ b.model }}" selected>{{ b.model }} (saved)</option>
+      {% endif %}
+    </select>
+    {% elif b.key_set %}
+    <div style="color:var(--warn); margin-bottom:8px;">
+      Couldn't fetch the model list from this proxy. Check the URL/key, use
+      "Refresh", or type a model id below.
+    </div>
+    <input type="text" id="{{ b.role }}_model" name="model" value="{{ b.model }}"
+           placeholder="model id">
+    {% else %}
+    <div style="color:var(--muted); margin-bottom:8px;">
+      Save a URL + key first (Step 1), then this becomes a model picker.
+    </div>
+    <input type="hidden" name="model" value="{{ b.model }}">
+    {% endif %}
+
+    <div class="form-footer">
+      {% if b.key_set %}<a href="/admin/proxy">Refresh models</a>{% endif %}
+      <button type="submit">Save {{ b.label }}</button>
+    </div>
+  </form>
+</div>
+{% endfor %}
+{% endblock %}

@@ -10,3 +10,8 @@ services:
       - "${PORT:-8890}:8890"
     volumes:
       - ./data:/app/data
+      # Docker-out-of-Docker: the app's `docker` CLI drives the host daemon so
+      # it can spawn one sibling container per PR review (see app/container.py).
+      # NOTE: this grants the container root-equivalent control of the host —
+      # acceptable for a prototype; lock down (rootless/socket-proxy) for prod.
+      - /var/run/docker.sock:/var/run/docker.sock

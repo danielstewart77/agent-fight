@@ -116,11 +116,15 @@
   {% block nav %}
   <nav>
     <span class="brand">Agent Fight</span>
-    {% if request.session.get('admin') %}
+    {% if request.session.get('uid') %}
     <a href="/admin/">Dashboard</a>
     <a href="/admin/settings">Settings</a>
+    <a href="/admin/proxy">Proxy</a>
+    <a href="/admin/skills">Skills</a>
+    <a href="/admin/users">Users</a>
+    <a href="/admin/account">Account</a>
     <span class="spacer"></span>
-    <span>admin</span>
+    <span>{{ request.session.get('uname') }}</span>
     <form method="post" action="/logout" style="display:inline">
       <button type="submit">Log out</button>
     </form>

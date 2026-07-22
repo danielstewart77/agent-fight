@@ -1,8 +1,8 @@
-"""POST /webhooks/ado — inbound Azure DevOps webhook authentication."""
+"""POST /webhooks/ado — inbound Azure DevOps webhook: auth, parse, dispatch."""
 
 from __future__ import annotations
 
-from tests.conftest import login
+from tests.conftest import login, sample_ado_payload
 
 
 async def _configure_webhook_secret(client, secret: str) -> None:
@@ -11,12 +11,14 @@ async def _configure_webhook_secret(client, secret: str) -> None:
         "/admin/settings",
         data={
             "round_cap": "3",
-            "ado_organization": "",
+            "ado_organization": "contoso",
             "ado_project": "",
             "ado_pat": "",
             "webhook_secret": secret,
             "clone_credential_kind": "token",
             "clone_credential_secret": "",
+            "proxy_base_url": "",
+            "proxy_api_key": "",
         },
     )
     assert resp.status_code == 303
@@ -42,10 +44,48 @@ async def test_webhook_wrong_secret_returns_401(client):
     assert resp.status_code == 401
 
 
-async def test_webhook_correct_secret_returns_202_not_yet_implemented(client):
+async def test_webhook_valid_payload_dispatches_and_returns_202(client):
     await _configure_webhook_secret(client, "correct-secret")
-    resp = await client.post("/webhooks/ado", headers={"X-Webhook-Secret": "correct-secret"})
+    resp = await client.post(
+        "/webhooks/ado",
+        headers={"X-Webhook-Secret": "correct-secret"},
+        json=sample_ado_payload(),
+    )
     assert resp.status_code == 202
-    body = resp.json()
-    assert body["status"] == "accepted"
-    assert "not yet implemented" in body["detail"]
+    assert resp.json() == {"status": "accepted", "pr_id": 42}
+    # The parsed job reached the dispatcher.
+    assert len(client.dispatcher.jobs) == 1
+    assert client.dispatcher.jobs[0].pr_id == 42
+    assert client.dispatcher.jobs[0].source_branch == "feature-x"
+
+
+async def test_webhook_non_json_body_returns_400(client):
+    await _configure_webhook_secret(client, "correct-secret")
+    resp = await client.post(
+        "/webhooks/ado",
+        headers={"X-Webhook-Secret": "correct-secret", "content-type": "application/json"},
+        content=b"not json",
+    )
+    assert resp.status_code == 400
+
+
+async def test_webhook_malformed_payload_returns_400(client):
+    await _configure_webhook_secret(client, "correct-secret")
+    resp = await client.post(
+        "/webhooks/ado",
+        headers={"X-Webhook-Secret": "correct-secret"},
+        json={"eventType": "git.pullrequest.created", "resource": {}},
+    )
+    assert resp.status_code == 400
+
+
+async def test_webhook_unsupported_event_is_ignored_not_dispatched(client):
+    await _configure_webhook_secret(client, "correct-secret")
+    resp = await client.post(
+        "/webhooks/ado",
+        headers={"X-Webhook-Secret": "correct-secret"},
+        json={"eventType": "git.push", "resource": {}},
+    )
+    assert resp.status_code == 202
+    assert resp.json()["status"] == "ignored"
+    assert client.dispatcher.jobs == []

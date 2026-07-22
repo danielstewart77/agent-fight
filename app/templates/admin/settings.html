@@ -5,7 +5,9 @@
 <p>Run configuration for the code-review consensus loop: the round cap, the
    Azure DevOps account/org/project connection and its PAT, the webhook
    shared secret used to authenticate inbound ADO calls, and the clone
-   credential the per-review container uses to pull the target repo.
+   credential the per-review container uses to pull the target repo. (The
+   inference-proxy connections are configured separately at
+   <a href="/admin/proxy">Proxy</a>.)
    Secret fields are write-only — the stored value is never echoed back;
    leave a secret field blank to keep the current value.</p>
 

@@ -1,0 +1,48 @@
+{% extends "_base.html" %}
+{% block title %}Skills — Agent Fight{% endblock %}
+{% block content %}
+<h1>Agent skills</h1>
+<p>Each harness's skills repo is cloned once on the host
+   (<code>{{ skills_root }}</code>) and the skills you select below are
+   bind-mounted read-only into that harness's review container. Set the repo
+   URLs, <strong>Save</strong>, then <strong>Sync</strong> to clone/pull —
+   after which the available skills appear as checkboxes.</p>
+
+<form method="post" action="/admin/skills/sync" style="margin-bottom:16px;">
+  <button type="submit">Sync repos (clone / pull)</button>
+</form>
+
+<form method="post" action="/admin/skills">
+  {% for r in repos %}
+  <div class="card" style="max-width: 640px;">
+    <h2 style="margin-top:0; color:var(--fg);">{{ r.role }} — {{ r.repo }}</h2>
+
+    <label for="{{ r.role }}_skills_repo">Repo URL</label>
+    <input type="text" id="{{ r.role }}_skills_repo" name="{{ r.role }}_skills_repo"
+           value="{{ r.url }}" placeholder="https://dev.azure.com/org/project/_git/{{ r.repo }}">
+
+    <p style="color:var(--muted); margin:8px 0;">
+      {% if r.present %}cloned — <code>{{ r.head }}</code>{% elif r.configured %}
+      configured, not synced yet{% else %}not configured{% endif %}
+      &nbsp;→&nbsp; mounts at <code>{{ r.mount }}</code>
+    </p>
+
+    <label>Skills for this harness</label>
+    {% if r.available %}
+      {% for s in r.available %}
+      <div><label style="display:inline; color:var(--fg);">
+        <input type="checkbox" name="{{ r.role }}_skill" value="{{ s }}"
+               {% if s in r.selected %}checked{% endif %}> {{ s }}
+      </label></div>
+      {% endfor %}
+    {% else %}
+      <p style="color:var(--muted);">No skills discovered — set the URL, Save, then Sync.</p>
+    {% endif %}
+  </div>
+  {% endfor %}
+
+  <div class="form-footer" style="max-width: 640px;">
+    <button type="submit">Save</button>
+  </div>
+</form>
+{% endblock %}
