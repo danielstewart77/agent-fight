@@ -22,8 +22,12 @@ RUN npm install -g @anthropic-ai/claude-code @openai/codex \
 
 # /work is the clone target; the non-root user must own it. Codex reads
 # ~/.codex/{auth.json,config.toml}, which the app writes at provision time
-# (app/container.py) under this user's HOME.
-RUN mkdir -p /work && chown -R node:node /work
+# (app/container.py) under this user's HOME. Pre-create the skills dirs
+# node-owned so a read-only skill bind-mount into ~/.claude/skills or
+# ~/.codex/skills doesn't leave docker creating a root-owned parent that then
+# blocks the node user from writing auth.json/config.toml.
+RUN mkdir -p /work /home/node/.claude/skills /home/node/.codex/skills \
+    && chown -R node:node /work /home/node/.claude /home/node/.codex
 ENV HOME=/home/node
 WORKDIR /work
 USER node

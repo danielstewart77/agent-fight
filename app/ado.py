@@ -24,12 +24,13 @@ from app.review.models import ReviewJob
 SUPPORTED_EVENTS = ("git.pullrequest.created", "git.pullrequest.updated")
 ADO_API_VERSION = "7.1"
 
-# Prepended to every posted review; its first line is also the marker used to
-# find our own thread on a re-review so we update it instead of duplicating.
-REVIEW_MARKER = "Agent-fight consensus review"
+# Prepended to every posted review. REVIEW_MARKER is a stable substring of the
+# header used to find our own thread on a re-review so we update it instead of
+# duplicating; keep it stable across header wording changes.
+REVIEW_MARKER = "consensus review"
 REVIEW_HEADER = (
-    f"🤖 **{REVIEW_MARKER}** — Claude + Codex reviewed this PR independently "
-    "and debated to convergence.\n\n"
+    "**Agent🥊🤖🥊Fight - consensus review** — Claude + Codex reviewed this PR "
+    "independently and debated to convergence.\n\n"
 )
 
 
