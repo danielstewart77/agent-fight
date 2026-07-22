@@ -67,6 +67,20 @@ def test_settings_table_has_inference_proxy_columns(tmp_path):
     assert {"proxy_base_url", "proxy_api_key"} <= cols
 
 
+def test_users_table_created_with_expected_columns(tmp_path):
+    """Migration 0003 adds the users table."""
+    db = tmp_path / "agent_fight.db"
+    _upgrade_into(db)
+    engine = create_engine(f"sqlite:///{db}")
+    try:
+        tables = set(inspect(engine).get_table_names())
+        cols = {c["name"] for c in inspect(engine).get_columns("users")} if "users" in tables else set()
+    finally:
+        engine.dispose()
+    assert "users" in tables
+    assert {"id", "username", "password_hash", "created_at", "updated_at"} <= cols
+
+
 def test_migration_does_not_insert_the_singleton_row(tmp_path):
     """Schema-only migration — the id=1 row is created lazily by the app."""
     db = tmp_path / "agent_fight.db"

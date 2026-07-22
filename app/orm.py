@@ -22,6 +22,31 @@ class Base(DeclarativeBase):
     """Base class for all ORM models. UTC datetimes throughout."""
 
 
+class User(Base):
+    """An operator account. Flat model — every user is a full operator: they
+    can log in, edit settings, and manage other users. There is no role column.
+
+    `username` is stored normalized (lowercase, trimmed) and is unique.
+    `password_hash` is a bcrypt hash (see app/security.py) — never a plaintext
+    password. The first user is seeded from the ADMIN_USERNAME/ADMIN_PASSWORD
+    env vars on startup when the table is empty (see app/main.py); after that,
+    accounts are managed entirely in-app and env is break-glass only.
+    """
+
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    username: Mapped[str] = mapped_column(Unicode(256), nullable=False, unique=True)
+    password_hash: Mapped[str] = mapped_column(Unicode(255), nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
 class Settings(Base):
     """Singleton row (id is always 1) holding the admin-configured run settings.
 

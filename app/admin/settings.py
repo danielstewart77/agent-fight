@@ -18,7 +18,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import require_html_admin
+from app.auth import require_login
 from app.db import get_session
 from app.orm import Settings
 from app.templating import templates
@@ -108,7 +108,7 @@ async def show_settings(
     request: Request,
     session: AsyncSession = Depends(get_session),
 ):
-    await require_html_admin(request)
+    await require_login(request)
     row = await _get_or_create_settings(session)
     return templates.TemplateResponse(
         request,
@@ -131,7 +131,7 @@ async def update_settings(
     proxy_api_key: str = Form(""),
     session: AsyncSession = Depends(get_session),
 ):
-    await require_html_admin(request)
+    await require_login(request)
     row = await _get_or_create_settings(session)
 
     row.round_cap = _validate_round_cap(round_cap)

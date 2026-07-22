@@ -25,11 +25,14 @@ class Config:
     # to relocate it (e.g. onto a mounted volume).
     db_path: str = os.getenv("DB_PATH", str(REPO_ROOT / "data" / "agent_fight.db"))
 
-    # Admin console. The admin is a single operator identity held in env, not
-    # a row in the database. All run settings (ADO connection, webhook
-    # secret, clone credential) live in the `settings` table instead, managed
-    # through the admin console — see app/admin/settings.py.
+    # Session signing key for the admin console cookie.
     session_secret: str = os.getenv("SESSION_SECRET", "change-me-in-production")
+
+    # First-user seed / break-glass credentials. Operators are rows in the
+    # `users` table (see app/orm.py), managed through /admin/users. On startup,
+    # if that table is empty, one user is seeded from these values (see
+    # app/main.py::_seed_first_user). Once any user exists these are ignored for
+    # login — change your password in-app, not here.
     admin_username: str = os.getenv("ADMIN_USERNAME", "")
     admin_password: str = os.getenv("ADMIN_PASSWORD", "")
 

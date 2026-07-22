@@ -19,9 +19,10 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
-from app.orm import Base
+from app.orm import Base, User
+from app.security import hash_password
 
-ADMIN_USERNAME = "admin"
+ADMIN_USERNAME = "daniel"
 ADMIN_PASSWORD = "test-password"
 
 
@@ -38,14 +39,9 @@ async def session() -> AsyncSession:
 
 
 @pytest_asyncio.fixture
-async def client(monkeypatch):
-    """An httpx AsyncClient wired to the app, with admin credentials set and
-    a shared in-memory database."""
-    from app.config import config
-
-    monkeypatch.setattr(config, "admin_username", ADMIN_USERNAME)
-    monkeypatch.setattr(config, "admin_password", ADMIN_PASSWORD)
-
+async def client():
+    """An httpx AsyncClient wired to the app over a shared in-memory database,
+    pre-seeded with one operator account (ADMIN_USERNAME / ADMIN_PASSWORD)."""
     engine = create_async_engine(
         "sqlite+aiosqlite://",
         future=True,
@@ -55,6 +51,11 @@ async def client(monkeypatch):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     maker = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+
+    # Seed the operator the login() helper authenticates as.
+    async with maker() as s:
+        s.add(User(username=ADMIN_USERNAME, password_hash=hash_password(ADMIN_PASSWORD)))
+        await s.commit()
 
     async def _get_test_session():
         async with maker() as s:

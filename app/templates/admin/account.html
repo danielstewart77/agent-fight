@@ -1,0 +1,30 @@
+{% extends "_base.html" %}
+{% block title %}Account — Agent Fight{% endblock %}
+{% block content %}
+<h1>Account</h1>
+<p>Signed in as <strong>{{ user.username if user else '?' }}</strong>. Change your
+   password below — you'll need your current password to confirm it's you.</p>
+
+{% if error %}<div class="card error">{{ error }}</div>{% endif %}
+{% if ok %}<div class="card ok">{{ ok }}</div>{% endif %}
+
+<div class="card" style="max-width: 480px;">
+  <form method="post" action="/admin/account/password">
+    <label for="current_password">Current password</label>
+    <input type="password" id="current_password" name="current_password"
+           autocomplete="current-password" required>
+
+    <label for="new_password">New password</label>
+    <input type="password" id="new_password" name="new_password"
+           autocomplete="new-password" minlength="8" required>
+
+    <label for="confirm">Confirm new password</label>
+    <input type="password" id="confirm" name="confirm"
+           autocomplete="new-password" minlength="8" required>
+
+    <div class="form-footer">
+      <button type="submit">Update password</button>
+    </div>
+  </form>
+</div>
+{% endblock %}

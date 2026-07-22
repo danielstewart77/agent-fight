@@ -1,53 +1,84 @@
-"""Admin console session auth.
+"""Admin console session auth, backed by the `users` table.
 
-The admin is a single operator identity held in environment config — there
-is no user table and no self-service portal. Login is a constant-time
-comparison and the session carries nothing but an "is admin" flag. There is
-no per-caller proxy-key model here (unlike inference-proxy's Client/ApiKey
-machinery): the only other principal is Azure DevOps itself, authenticated
-on the webhook route via the shared secret stored in `Settings.webhook_secret`
-(see app/webhooks.py), not via a session.
+Every operator has a `User` row (see app/orm.py); login authenticates the
+submitted credentials against it and the session then carries that user's
+identity. The model is flat — any logged-in user is a full operator — so the
+only guard is "are you logged in" (`require_login`). The other principal is
+Azure DevOps itself, authenticated on the webhook route via the shared secret
+in `Settings.webhook_secret` (see app/webhooks.py), not via a session.
+
+The very first account is seeded from the ADMIN_USERNAME/ADMIN_PASSWORD env
+vars on startup when the table is empty (see app/main.py); after that, env is
+break-glass only and all auth goes through the DB.
 """
 
 from __future__ import annotations
 
-import hmac
-
 from fastapi import HTTPException, Request, status
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import config
+from app.orm import User
+from app.security import verify_password
 
-SESSION_ADMIN_KEY = "admin"
+SESSION_UID_KEY = "uid"
+SESSION_UNAME_KEY = "uname"
 
 
-def verify_admin_credentials(username: str, password: str) -> bool:
-    """Constant-time check against the configured admin identity.
+def normalize_username(username: str) -> str:
+    """Usernames are compared/stored case-insensitively and trimmed."""
+    return (username or "").strip().lower()
 
-    Returns False when either config value is unset, so an unconfigured
-    deploy cannot be signed into at all.
+
+async def authenticate(session: AsyncSession, username: str, password: str) -> User | None:
+    """Return the matching user for valid credentials, else None.
+
+    Runs the password check even when the user is missing would be ideal to
+    equalize timing; bcrypt's cost already dominates, and we keep it simple by
+    returning None on a missing user. No response difference distinguishes
+    "unknown user" from "wrong password" at the route layer.
     """
-    if not config.admin_username or not config.admin_password:
-        return False
-    ok_user = hmac.compare_digest(username, config.admin_username)
-    ok_pass = hmac.compare_digest(password, config.admin_password)
-    return ok_user and ok_pass
+    row = (
+        await session.execute(
+            select(User).where(User.username == normalize_username(username))
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        return None
+    if not verify_password(password, row.password_hash):
+        return None
+    return row
 
 
-def login_session(request: Request) -> None:
-    request.session[SESSION_ADMIN_KEY] = True
+def login_session(request: Request, user: User) -> None:
+    """Establish an authenticated session for `user`.
+
+    The session is cleared first so a pre-login session id cannot be reused
+    post-login (session-fixation hygiene)."""
+    request.session.clear()
+    request.session[SESSION_UID_KEY] = user.id
+    request.session[SESSION_UNAME_KEY] = user.username
 
 
 def logout_session(request: Request) -> None:
-    request.session.pop(SESSION_ADMIN_KEY, None)
+    request.session.clear()
 
 
-def is_admin_session(request: Request) -> bool:
-    return bool(request.session.get(SESSION_ADMIN_KEY))
+def is_authenticated(request: Request) -> bool:
+    return request.session.get(SESSION_UID_KEY) is not None
 
 
-async def require_html_admin(request: Request) -> None:
+def current_uid(request: Request) -> int | None:
+    return request.session.get(SESSION_UID_KEY)
+
+
+def current_username(request: Request) -> str | None:
+    return request.session.get(SESSION_UNAME_KEY)
+
+
+async def require_login(request: Request) -> None:
     """Guard for admin console HTML routes. Raises a 303 redirect to /login."""
-    if not is_admin_session(request):
+    if not is_authenticated(request):
         raise _redirect("/login")
 
 
