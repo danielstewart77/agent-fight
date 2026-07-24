@@ -8,8 +8,17 @@ services:
     restart: unless-stopped
     ports:
       - "${PORT:-8890}:8890"
+    environment:
+      # Skills are bind-mounted into review containers by the HOST daemon (DooD),
+      # so their source path must be valid on the host. We mount the host skills
+      # dir at the SAME absolute path inside this container and point the app at
+      # it, so the `-v <host>:<ctr>:ro` paths the app emits resolve on the host.
+      # Must be an absolute host path; keep it identical to the volume below.
+      - SKILLS_ROOT=${SKILLS_ROOT:-/srv/agent-fight/skills}
     volumes:
       - ./data:/app/data
+      # Skills at an identical in/out absolute path — see SKILLS_ROOT above.
+      - ${SKILLS_ROOT:-/srv/agent-fight/skills}:${SKILLS_ROOT:-/srv/agent-fight/skills}
       # Docker-out-of-Docker: the app's `docker` CLI drives the host daemon so
       # it can spawn one sibling container per PR review (see app/container.py).
       # NOTE: this grants the container root-equivalent control of the host —

@@ -1,0 +1,90 @@
+{% extends "_base.html" %}
+{% block title %}Review #{{ r.pr_id }} — Agent Fight{% endblock %}
+{% block content %}
+<style>
+  main { max-width: 1040px; }
+  .muted { color: var(--muted); }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; border: 1px solid var(--border); }
+  .badge.ok { color: var(--ok); }
+  .badge.warn { color: var(--warn); }
+  .badge.danger { color: var(--danger); }
+  .badge.muted { color: var(--muted); }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  pre.review {
+    white-space: pre-wrap; word-wrap: break-word; margin: 0;
+    font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  dl.meta { display: grid; grid-template-columns: max-content 1fr; gap: 6px 20px; margin: 0; }
+  dl.meta dt { color: var(--muted); }
+  dl.meta dd { margin: 0; }
+</style>
+{% set sc = {'converged':'ok','capped':'warn','failed':'danger','running':'muted'} %}
+
+<p class="muted"><a href="/admin/reviews">← Reviews</a></p>
+<h1>PR #{{ r.pr_id }} — {{ r.repo_name }}
+  <span class="badge {{ sc.get(r.status, 'muted') }}">{{ r.status }}</span></h1>
+
+<div class="card">
+  <dl class="meta">
+    <dt>Pull request</dt>
+    <dd>{% if r.pr_web_url %}<a href="{{ r.pr_web_url }}">{{ r.pr_web_url }}</a>{% else %}#{{ r.pr_id }}{% endif %}</dd>
+    <dt>Branches</dt><dd><code>{{ r.source_branch }}</code> → <code>{{ r.target_branch }}</code></dd>
+    <dt>Project</dt><dd>{{ r.organization or '—' }} / {{ r.project or '—' }}</dd>
+    <dt>Rounds used</dt><dd>{{ r.rounds_used }}</dd>
+    <dt>Findings</dt><dd>{{ r.converged_count }} agreed · {{ r.disagreement_count }} disagreed · {{ r.unmatched_count }} one-sided</dd>
+    <dt>Started</dt><dd>{{ r.started_at.strftime('%Y-%m-%d %H:%M:%S') if r.started_at else '—' }}</dd>
+    <dt>Duration</dt><dd>{% if r.duration_ms is not none %}{{ "%.1f"|format(r.duration_ms / 1000) }}s{% else %}—{% endif %}</dd>
+  </dl>
+</div>
+
+{% if r.error %}
+<div class="card">
+  <h2 style="color: var(--danger)">Failure</h2>
+  <pre class="review error">{{ r.error }}</pre>
+</div>
+{% endif %}
+
+<div class="card">
+  <h2>Token usage</h2>
+  {% if not usage %}
+  <p class="muted">No token usage recorded for this run.</p>
+  {% else %}
+  <table>
+    <thead>
+      <tr><th>Round</th><th>Role</th><th class="num">Input</th><th class="num">Output</th>
+          <th class="num">Cache (r/w)</th><th class="num">Cost</th></tr>
+    </thead>
+    <tbody>
+      {% for u in usage %}
+      <tr>
+        <td>{{ u.round_no }}</td>
+        <td>{{ u.role }}</td>
+        <td class="num">{{ "{:,}".format(u.input_tokens) }}</td>
+        <td class="num">{{ "{:,}".format(u.output_tokens) }}</td>
+        <td class="num muted">{{ "{:,}".format(u.cache_read_tokens) }} / {{ "{:,}".format(u.cache_creation_tokens) }}</td>
+        <td class="num">{% if u.cost_usd is not none %}${{ "%.4f"|format(u.cost_usd) }}{% else %}<span class="muted">—</span>{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+    <tfoot>
+      <tr>
+        <td colspan="2"><strong>Total</strong></td>
+        <td class="num"><strong>{{ "{:,}".format(tokens.input) }}</strong></td>
+        <td class="num"><strong>{{ "{:,}".format(tokens.output) }}</strong></td>
+        <td class="num muted">{{ "{:,}".format(tokens.cache) }}</td>
+        <td class="num"><strong>{% if tokens.cost is not none %}${{ "%.4f"|format(tokens.cost) }}{% else %}—{% endif %}</strong></td>
+      </tr>
+    </tfoot>
+  </table>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>Posted review</h2>
+  {% if r.final_review_md %}
+  <pre class="review">{{ r.final_review_md }}</pre>
+  {% else %}
+  <p class="muted">Nothing was posted (run did not complete).</p>
+  {% endif %}
+</div>
+{% endblock %}

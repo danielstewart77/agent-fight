@@ -1,0 +1,48 @@
+{% extends "_base.html" %}
+{% block title %}Reviews — Agent Fight{% endblock %}
+{% block content %}
+<style>
+  main { max-width: 1040px; }
+  .muted { color: var(--muted); }
+  .badge {
+    display: inline-block; padding: 2px 8px; border-radius: 10px;
+    font-size: 12px; border: 1px solid var(--border);
+  }
+  .badge.ok { color: var(--ok); }
+  .badge.warn { color: var(--warn); }
+  .badge.danger { color: var(--danger); }
+  .badge.muted { color: var(--muted); }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+</style>
+{% set sc = {'converged':'ok','capped':'warn','failed':'danger','running':'muted'} %}
+<h1>Reviews</h1>
+{% if not reviews %}
+<p class="muted">No reviews yet. They appear here once a PR webhook dispatches a run.</p>
+{% else %}
+<div class="card">
+  <table>
+    <thead>
+      <tr>
+        <th>PR</th><th>Repo</th><th>Status</th><th>Rounds</th>
+        <th title="agreed / disagreed / one-sided">Findings</th>
+        <th class="num">Tokens</th><th class="num">Cost</th><th>Started</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for v in reviews %}
+      <tr>
+        <td><a href="/admin/reviews/{{ v.r.id }}">#{{ v.r.pr_id }}</a></td>
+        <td>{{ v.r.repo_name }}</td>
+        <td><span class="badge {{ sc.get(v.r.status, 'muted') }}">{{ v.r.status }}</span></td>
+        <td>{{ v.r.rounds_used }}</td>
+        <td class="muted">{{ v.r.converged_count }} / {{ v.r.disagreement_count }} / {{ v.r.unmatched_count }}</td>
+        <td class="num">{{ "{:,}".format(v.tokens.total) }}</td>
+        <td class="num">{% if v.tokens.cost is not none %}${{ "%.4f"|format(v.tokens.cost) }}{% else %}<span class="muted">—</span>{% endif %}</td>
+        <td class="muted">{{ v.r.started_at.strftime('%Y-%m-%d %H:%M') if v.r.started_at else '—' }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+{% endblock %}

@@ -14,8 +14,17 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import CheckConstraint, DateTime, Integer, Unicode, UnicodeText, func
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy import (
+    CheckConstraint,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    Unicode,
+    UnicodeText,
+    func,
+)
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
 class Base(DeclarativeBase):
@@ -126,5 +135,107 @@ class Settings(Base):
         CheckConstraint(
             "clone_credential_kind IN ('token','ssh_key')",
             name="CK_settings_clone_credential_kind",
+        ),
+    )
+
+
+class Review(Base):
+    """One PR review run — created when a webhook dispatches a run and finalized
+    when it ends, success or failure. This is the persistent record behind the
+    metrics UI (/admin/reviews); before it existed, a run left no trace and a
+    failed run was only visible as a return code in the process log.
+
+    The PR identity/branches are copied from the `ReviewJob` so the row is
+    self-contained. `status` moves running -> converged | capped | failed.
+    `error` holds the traceback for a failed run (repo-prep, harness crash, …).
+    `final_review_md` is the exact comment posted back to the PR. Per-round,
+    per-role token accounting lives in the child `review_token_usage` rows.
+    """
+
+    __tablename__ = "reviews"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+
+    pr_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    repo_name: Mapped[str] = mapped_column(Unicode(512), nullable=False)
+    organization: Mapped[Optional[str]] = mapped_column(Unicode(256), nullable=True)
+    project: Mapped[Optional[str]] = mapped_column(Unicode(256), nullable=True)
+    source_branch: Mapped[Optional[str]] = mapped_column(Unicode(512), nullable=True)
+    target_branch: Mapped[Optional[str]] = mapped_column(Unicode(512), nullable=True)
+    pr_web_url: Mapped[Optional[str]] = mapped_column(Unicode(1024), nullable=True)
+    event_type: Mapped[Optional[str]] = mapped_column(Unicode(128), nullable=True)
+    # Source-branch tip commit reviewed (for the re-review loop-guard).
+    source_commit: Mapped[Optional[str]] = mapped_column(Unicode(64), nullable=True)
+
+    status: Mapped[str] = mapped_column(
+        Unicode(16), nullable=False, server_default="running"
+    )
+
+    rounds_used: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    converged_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    disagreement_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    unmatched_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+
+    final_review_md: Mapped[Optional[str]] = mapped_column(UnicodeText, nullable=True)
+    error: Mapped[Optional[str]] = mapped_column(UnicodeText, nullable=True)
+
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    duration_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+    token_usage: Mapped[list["ReviewTokenUsage"]] = relationship(
+        back_populates="review",
+        cascade="all, delete-orphan",
+        order_by="ReviewTokenUsage.round_no, ReviewTokenUsage.role",
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('running','converged','capped','failed')",
+            name="CK_reviews_status",
+        ),
+    )
+
+
+class ReviewTokenUsage(Base):
+    """Token (and, for Claude, cost) accounting for one role in one round of a
+    review. One row per (review, role, round_no); review-level totals are the
+    sum of its children. `role` is `claude` / `codex` / `coordinator`.
+
+    `cost_usd` is nullable because only the Claude harness reports a dollar cost
+    (`total_cost_usd` in its result event); NULL means "not reported".
+    """
+
+    __tablename__ = "review_token_usage"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    review_id: Mapped[int] = mapped_column(
+        ForeignKey("reviews.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+
+    role: Mapped[str] = mapped_column(Unicode(16), nullable=False)
+    round_no: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    output_tokens: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    cache_read_tokens: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    cache_creation_tokens: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0"
+    )
+    cost_usd: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+    review: Mapped["Review"] = relationship(back_populates="token_usage")
+
+    __table_args__ = (
+        CheckConstraint(
+            "role IN ('claude','codex','coordinator')",
+            name="CK_review_token_usage_role",
         ),
     )

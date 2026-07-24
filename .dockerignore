@@ -1,0 +1,13 @@
+# Keep the build context small and free of host-only state. The image copies
+# only app/, migrations/, alembic.ini, requirements.txt (see Dockerfile).
+.venv/
+data/
+.git/
+.gitignore
+__pycache__/
+*.pyc
+.pytest_cache/
+plans/
+tests/
+*.db
+.env

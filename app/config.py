@@ -17,6 +17,12 @@ class Config:
     port: int = int(os.getenv("PORT", "8890"))
     enable_logging: bool = os.getenv("ENABLE_LOGGING", "true").lower() == "true"
 
+    # Max PR reviews running concurrently. Each review is a container + several
+    # harness/coordinator proxy calls, so unbounded fan-out on a burst of PRs can
+    # overload the host or trip proxy rate limits. Excess reviews queue and start
+    # as slots free (see app/runner.py::ReviewDispatcher).
+    review_concurrency: int = int(os.getenv("REVIEW_CONCURRENCY", "5"))
+
     # Docker image used for each per-review container. Must have git and the
     # harness CLIs (claude, codex) installed. See app/container.py.
     review_image: str = os.getenv("REVIEW_IMAGE", "agent-fight-review:latest")

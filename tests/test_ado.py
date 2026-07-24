@@ -39,6 +39,17 @@ def test_parse_valid_payload():
     assert job.pr_web_url.endswith("/pullrequest/42")
 
 
+def test_parse_extracts_source_commit():
+    p = sample_ado_payload()
+    p["resource"]["lastMergeSourceCommit"] = {"commitId": "abc123def"}
+    job = parse_pull_request_event(p, _settings())
+    assert job.source_commit == "abc123def"
+
+
+def test_parse_source_commit_empty_when_absent():
+    assert parse_pull_request_event(sample_ado_payload(), _settings()).source_commit == ""
+
+
 def test_project_falls_back_to_settings_when_absent():
     payload = sample_ado_payload()
     del payload["resource"]["repository"]["project"]
@@ -86,6 +97,45 @@ async def test_post_pr_review_builds_correct_request():
     expected_auth = "Basic " + base64.b64encode(b":my-pat").decode()
     assert captured["auth"] == expected_auth
     assert "looks good" in captured["body"]
+
+
+async def test_set_pr_vote_resolves_reviewer_and_puts_vote():
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json as _json
+        calls.append((request.method, str(request.url)))
+        if "connectionData" in str(request.url):
+            return httpx.Response(200, json={"authenticatedUser": {"id": "rev-guid-9"}})
+        # the PUT reviewer vote
+        calls.append(("BODY", _json.loads(request.read())))
+        return httpx.Response(200, json={"vote": -5})
+
+    job = parse_pull_request_event(sample_ado_payload(), _settings())
+    client = AdoClient(client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    await client.set_pr_vote(_settings(ado_pat="p"), job, -5)
+
+    put = [c for c in calls if c[0] == "PUT"]
+    assert put and "/pullRequests/42/reviewers/rev-guid-9" in put[0][1]
+    body = [c for c in calls if c[0] == "BODY"]
+    assert body and body[0][1] == {"vote": -5}
+    # connectionData is preview-only — a plain api-version=7.1 gets a 400.
+    conn = [c for c in calls if "connectionData" in c[1]]
+    assert conn and "preview" in conn[0][1]
+
+
+async def test_set_pr_vote_zero_is_noop():
+    called = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return httpx.Response(200, json={})
+
+    job = parse_pull_request_event(sample_ado_payload(), _settings())
+    client = AdoClient(client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    await client.set_pr_vote(_settings(ado_pat="p"), job, 0)
+    assert called is False  # vote 0 -> nothing sent (not even connectionData)
 
 
 async def test_post_or_update_updates_existing_thread():

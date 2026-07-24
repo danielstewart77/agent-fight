@@ -1,7 +1,30 @@
 {% extends "_base.html" %}
 {% block title %}Admin — Agent Fight{% endblock %}
 {% block content %}
+<style>
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+  .tile { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 16px; }
+  .tile .n { font-size: 26px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .tile .k { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .muted { color: var(--muted); }
+</style>
 <h1>Admin</h1>
+
+<h2>Review metrics</h2>
+<div class="tiles">
+  <div class="tile"><div class="n">{{ metrics.total }}</div><div class="k">reviews</div></div>
+  <div class="tile">
+    <div class="n">{% if metrics.converged_pct is not none %}{{ metrics.converged_pct }}%{% else %}—{% endif %}</div>
+    <div class="k">converged ({{ metrics.converged }}/{{ metrics.total }})</div>
+  </div>
+  <div class="tile"><div class="n">{{ metrics.failed }}</div><div class="k">failed</div></div>
+  <div class="tile"><div class="n">{% if metrics.avg_rounds is not none %}{{ metrics.avg_rounds }}{% else %}—{% endif %}</div><div class="k">avg rounds</div></div>
+  <div class="tile"><div class="n">{{ "{:,}".format(metrics.total_tokens) }}</div><div class="k">tokens</div></div>
+  <div class="tile"><div class="n">{% if metrics.total_cost is not none %}${{ "%.2f"|format(metrics.total_cost) }}{% else %}—{% endif %}</div><div class="k">est. cost</div></div>
+</div>
+<p style="margin-top:12px"><a href="/admin/reviews">View all reviews →</a></p>
+
+<h2>Configuration</h2>
 <div class="card">
   <table>
     <tbody>

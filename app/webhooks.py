@@ -11,6 +11,7 @@ app/coordinator.py.
 from __future__ import annotations
 
 import hmac
+import logging
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from sqlalchemy import select
@@ -18,11 +19,35 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ado import MalformedPayload, UnsupportedEvent, parse_pull_request_event
 from app.db import get_session
-from app.orm import Settings
+from app.orm import Review, Settings
 
 router = APIRouter()
 
+logger = logging.getLogger("agent_fight.webhooks")
+
 SETTINGS_ID = 1
+
+
+async def _already_reviewed(session: AsyncSession, pr_id: int, source_commit: str) -> bool:
+    """True if this PR's source commit was already reviewed (or is being
+    reviewed) and did NOT fail — the loop-guard so a `pullrequest.updated`
+    event fired by our own comment/vote (same commit) doesn't re-trigger.
+
+    A failed prior review is NOT a match (we want retries to go through), and a
+    missing/unknown commit never matches (guard is best-effort; the subscription
+    filter is the primary control)."""
+    if not source_commit:
+        return False
+    row = (
+        await session.execute(
+            select(Review.id)
+            .where(Review.pr_id == pr_id)
+            .where(Review.source_commit == source_commit)
+            .where(Review.status != "failed")
+            .limit(1)
+        )
+    ).first()
+    return row is not None
 
 
 @router.post("/webhooks/ado", status_code=202)
@@ -56,6 +81,15 @@ async def receive_ado_webhook(
         return {"status": "ignored", "detail": str(exc)}
     except MalformedPayload as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+    # Loop-guard: don't re-review a source commit we've already reviewed (an
+    # updated-event fired by our own comment/vote reports the same commit).
+    if await _already_reviewed(session, job.pr_id, job.source_commit):
+        logger.info(
+            "PR %s: skipping — commit %s already reviewed",
+            job.pr_id, job.source_commit[:12],
+        )
+        return {"status": "skipped", "detail": "commit already reviewed", "pr_id": job.pr_id}
 
     request.app.state.review_dispatcher.dispatch(job)
     return {"status": "accepted", "pr_id": job.pr_id}

@@ -5,15 +5,24 @@ from __future__ import annotations
 
 import json
 
-from app.container import FINDINGS_DIR, FakeHandle, FakeRunner
+import pytest
+
+from app.container import ExecResult, FINDINGS_DIR, FakeHandle, FakeRunner
 from app.coordinator import (
     convergence,
+    parse_coordinator_decision,
     parse_findings,
     run_review,
     synthesize_final_review,
 )
 from app.orm import Settings
-from app.review.models import Finding, HarnessType
+from app.review.models import (
+    CoordinatorDecision,
+    Disagreement,
+    Finding,
+    HarnessType,
+    ReviewFailure,
+)
 from tests.conftest import sample_ado_payload
 from app.ado import parse_pull_request_event
 
@@ -51,7 +60,7 @@ def test_convergence_agree_disagree_unmatched():
     ]
     right = [
         Finding("a.py", 10, "bug", verdict="issue"),        # agree
-        Finding("b.py", 20, "smell", verdict="resolved"),   # disagree
+        Finding("b.py", 20, "smell", verdict="disagree"),   # explicit open dispute
         Finding("d.py", 40, "only-right", verdict="issue"), # unmatched
     ]
     result = convergence(left, right)
@@ -87,10 +96,34 @@ def test_convergence_both_resolved_reports_nothing():
     assert r.converged == [] and r.disagreements == [] and r.unmatched == []
 
 
-def test_convergence_issue_vs_resolved_is_disagreement():
+def test_convergence_issue_vs_resolved_is_agreement_not_disagreement():
+    # One side still calls it an issue, the other marked it resolved (settled in
+    # the debate). That is NOT an open disagreement — the reviewers converged;
+    # only an explicit `disagree` keeps an item open. (Regression: these used to
+    # be surfaced under "Unresolved disagreements".)
+    left = [Finding("a.py", 1, "misleading coverage", verdict="issue")]
+    right = [Finding("a.py", 1, "misleading coverage", verdict="resolved")]
+    r = convergence(left, right)
+    assert r.disagreements == []
+    assert {f.file for f in r.converged} == {"a.py"}
+    assert r.converged[0].claim == "misleading coverage"  # substantive side kept
+
+
+def test_convergence_nit_and_agree_is_agreement():
+    # (agent 1: nit, agent 2: agree) — both affirm a minor concern -> converged.
+    left = [Finding("h.ts", 276, "duplication nit", severity="nit", verdict="nit")]
+    right = [Finding("h.ts", 276, "duplication nit", severity="nit", verdict="agree")]
+    r = convergence(left, right)
+    assert r.disagreements == []
+    assert {f.file for f in r.converged} == {"h.ts"}
+
+
+def test_convergence_explicit_disagree_is_the_only_open_dispute():
     left = [Finding("a.py", 1, "x", verdict="issue")]
-    right = [Finding("a.py", 1, "x", verdict="resolved")]
-    assert len(convergence(left, right).disagreements) == 1
+    right = [Finding("a.py", 1, "x", verdict="disagree")]
+    r = convergence(left, right)
+    assert len(r.disagreements) == 1
+    assert not r.fully_converged
 
 
 def test_convergence_one_sided_resolved_drops():
@@ -111,7 +144,7 @@ def test_synthesize_surfaces_all_sections():
     consensus = [Finding("a.py", 10, "agreed bug", severity="high", verdict="issue")]
     disagreements = convergence(
         [Finding("b.py", 20, "contested", verdict="issue")],
-        [Finding("b.py", 20, "contested", verdict="resolved")],
+        [Finding("b.py", 20, "contested", verdict="disagree")],
     ).disagreements
     unmatched = [Finding("c.py", 30, "one-sided concern", verdict="issue")]
     md = synthesize_final_review(consensus, disagreements, unmatched)
@@ -153,6 +186,62 @@ def test_synthesize_pr_review_format():
     assert "**Fix:** dispose it" in md
 
 
+# --- coordinator judgment parsing ------------------------------------------ #
+
+
+def test_parse_coordinator_decision_basic():
+    d = parse_coordinator_decision(json.dumps({
+        "converged": False,
+        "agreed": [{"file": "a.py", "line": 10, "claim": "bug",
+                    "severity": "major", "suggestion": "fix it"}],
+        "disagreed": [{"file": "b.py", "line": 5, "claim": "maybe",
+                       "agent1": "issue", "agent2": "not a bug"}],
+        "summary": "one open item",
+    }))
+    assert d.converged is False
+    assert len(d.agreed) == 1 and d.agreed[0].file == "a.py"
+    assert d.agreed[0].suggestion == "fix it"
+    assert len(d.disagreed) == 1
+    assert d.disagreed[0].left.verdict == "issue"
+    assert d.disagreed[0].right.verdict == "not a bug"
+
+
+def test_parse_coordinator_decision_tolerates_prose_and_fences():
+    text = 'Sure:\n```json\n{"converged": true, "agreed": [], "disagreed": []}\n```'
+    d = parse_coordinator_decision(text)
+    assert d.converged is True and d.agreed == [] and d.disagreed == []
+
+
+def test_parse_coordinator_decision_invalid_raises():
+    with pytest.raises(ValueError):
+        parse_coordinator_decision("no json here at all")
+
+
+def test_parse_coordinator_decision_vote_parsed_and_clamped():
+    d = parse_coordinator_decision(json.dumps({
+        "converged": True, "agreed": [], "disagreed": [],
+        "vote": 5, "vote_reason": "minor only",
+    }))
+    assert d.vote == 5 and d.vote_reason == "minor only"
+    # An out-of-range vote is dropped (None -> the loop derives one).
+    d2 = parse_coordinator_decision(json.dumps({"converged": True, "vote": 3}))
+    assert d2.vote is None
+
+
+def test_derive_vote_mapping():
+    from app.coordinator import _derive_vote
+    from app.review.models import Disagreement
+    # clean
+    assert _derive_vote([], [])[0] == 10
+    # minor/nit only
+    assert _derive_vote([Finding("a", 1, "x", severity="nit")], [])[0] == 5
+    # major/critical
+    assert _derive_vote([Finding("a", 1, "x", severity="critical")], [])[0] == -5
+    # any unresolved disagreement -> wait for author, regardless of severities
+    dis = [Disagreement("a", 1, Finding("a", 1, "x"), Finding("a", 1, "x", verdict="disagree"))]
+    assert _derive_vote([Finding("a", 2, "y", severity="nit")], dis)[0] == -5
+
+
 # --- full loop against FakeRunner ------------------------------------------ #
 
 
@@ -168,101 +257,221 @@ def _fpath(h: HarnessType, rnd: int) -> str:
     return f"{FINDINGS_DIR}/findings-{h.value}-round{rnd}.json"
 
 
+def _indep(h: HarnessType) -> str:
+    return f"{FINDINGS_DIR}/findings-{h.value}-independent.json"
+
+
 def _findings_json(items):
     return json.dumps({"findings": items})
+
+
+def _judge(converged, agreed=(), disagreed=()):
+    """A fake coordinator judge that ignores inputs and returns a canned
+    decision — lets loop tests exercise the new structure without an LLM."""
+    async def j(left, right, round_no):
+        return CoordinatorDecision(
+            converged=converged, agreed=list(agreed), disagreed=list(disagreed)
+        )
+    return j
+
+
+def _seed(indep=None, rounds=None):
+    """Build a FakeHandle.files dict seeding the independent (prep) findings and
+    each battle round for BOTH harnesses. `indep`/each round value is the items
+    list posted by both harnesses (same for both, for brevity)."""
+    files = {}
+    if indep is not None:
+        files[_indep(HarnessType.CLAUDE)] = _findings_json(indep)
+        files[_indep(HarnessType.CODEX)] = _findings_json(indep)
+    for rnd, items in (rounds or {}).items():
+        files[_fpath(HarnessType.CLAUDE, rnd)] = _findings_json(items)
+        files[_fpath(HarnessType.CODEX, rnd)] = _findings_json(items)
+    return files
 
 
 class _RecordingAdo:
     def __init__(self):
         self.posted = None
+        self.voted = None
 
     async def post_or_update_pr_review(self, settings, job, review_md):
         self.posted = review_md
         return "created"
 
+    async def set_pr_vote(self, settings, job, vote):
+        self.voted = vote
 
-async def test_run_review_early_convergence_round1():
-    same = [{"file": "a.py", "line": 10, "claim": "bug", "severity": "high", "verdict": "issue"}]
+
+async def test_prep_phase_then_judge_converges_round1():
+    bug = [{"file": "a.py", "line": 10, "claim": "bug", "severity": "major", "verdict": "issue"}]
+    handle = FakeHandle(files=_seed(indep=bug, rounds={1: bug}))
+    ado = _RecordingAdo()
+    agreed = [Finding("a.py", 10, "bug", severity="major", verdict="issue")]
+    outcome = await run_review(
+        _job(), _settings(round_cap=5), runner=FakeRunner(handle),
+        ado_client=ado, judge=_judge(True, agreed=agreed),
+    )
+    assert outcome.status == "converged"
+    assert outcome.rounds_used == 1           # battle rounds; prep is not counted
+    assert outcome.converged_count == 1
+    assert "Agreed findings" in outcome.review_md and "bug" in outcome.review_md
+    assert ado.posted == outcome.review_md
+    assert handle.stopped is True
+    # The independent prep pass ran (its findings file was written to/read).
+    assert _indep(HarnessType.CLAUDE) in handle.files
+    # A major agreed finding -> "wait for author" (-5), cast on the PR.
+    assert outcome.vote == -5
+    assert ado.voted == -5
+    assert "Reviewer vote:" in outcome.review_md
+
+
+async def test_cap_hit_surfaces_disagreement():
+    leak = [{"file": "a.py", "line": 10, "claim": "leak", "verdict": "issue"}]
+    handle = FakeHandle(files=_seed(indep=leak, rounds={1: leak, 2: leak}))
+    ado = _RecordingAdo()
+    dis = [Disagreement(
+        "a.py", 10,
+        Finding("a.py", 10, "leak", verdict="issue"),
+        Finding("a.py", 10, "leak", verdict="disagree"),
+    )]
+    outcome = await run_review(
+        _job(), _settings(round_cap=2), runner=FakeRunner(handle),
+        ado_client=ado, judge=_judge(False, disagreed=dis),
+    )
+    assert outcome.status == "capped"
+    assert outcome.rounds_used == 2
+    assert outcome.disagreement_count == 1
+    assert "Unresolved disagreements" in outcome.review_md
+    assert "a.py:10" in outcome.review_md
+    assert ado.posted is not None
+    # Unresolved disagreement -> wait for author (-5).
+    assert outcome.vote == -5 and ado.voted == -5
+
+
+async def test_llm_supplied_vote_is_honored():
+    bug = [{"file": "a.py", "line": 1, "claim": "bug", "verdict": "issue"}]
+    handle = FakeHandle(files=_seed(indep=bug, rounds={1: bug}))
+    ado = _RecordingAdo()
+
+    async def judge(left, right, round_no):
+        # Coordinator explicitly approves-with-suggestions despite a finding.
+        return CoordinatorDecision(
+            converged=True,
+            agreed=[Finding("a.py", 1, "bug", severity="minor", verdict="issue")],
+            vote=5, vote_reason="minor only, safe to merge",
+        )
+
+    outcome = await run_review(
+        _job(), _settings(round_cap=2), runner=FakeRunner(handle),
+        ado_client=ado, judge=judge,
+    )
+    assert outcome.vote == 5           # LLM's vote used, not re-derived
+    assert ado.voted == 5
+    assert "safe to merge" in outcome.review_md
+
+
+async def test_default_fallback_judge_converges_on_agreement():
+    # No judge injected -> deterministic fallback (convergence()); both agree.
+    bug = [{"file": "a.py", "line": 1, "claim": "bug", "verdict": "issue"}]
+    handle = FakeHandle(files=_seed(indep=bug, rounds={1: bug}))
+    ado = _RecordingAdo()
+    outcome = await run_review(
+        _job(), _settings(round_cap=3), runner=FakeRunner(handle), ado_client=ado
+    )
+    assert outcome.status == "converged"
+    assert outcome.rounds_used == 1
+    assert "bug" in outcome.review_md
+    assert ado.posted == outcome.review_md
+
+
+# --- fail-closed: a broken run must NEVER post a (false) clean/consensus ---- #
+
+
+async def test_harness_nonzero_exit_aborts_and_does_not_post():
+    # Both harnesses crash (the 4623 case) in the prep phase. Must raise, post nothing.
     handle = FakeHandle(
-        files={
-            _fpath(HarnessType.CLAUDE, 1): _findings_json(same),
-            _fpath(HarnessType.CODEX, 1): _findings_json(same),
+        exec_results={
+            "claude": ExecResult(rc=1, stdout="", stderr="401 Unauthorized"),
+            "codex": ExecResult(rc=1, stdout="", stderr="boom"),
         }
     )
     ado = _RecordingAdo()
-    review = await run_review(
-        _job(), _settings(round_cap=5), runner=FakeRunner(handle), ado_client=ado
-    )
-    assert "Agreed findings" in review
-    assert "bug" in review
-    # Converged in round 1 — no round-2 files were ever read.
-    assert handle.stopped is True          # teardown ran
-    assert ado.posted == review            # posted back
-    # The prompt reached each harness via stdin (not a dropped file).
-    piped = [s for s in handle.stdin_log if s]
-    assert piped and all("findings" in s.lower() for s in piped)
+    with pytest.raises(ReviewFailure) as ei:
+        await run_review(_job(), _settings(round_cap=3), runner=FakeRunner(handle), ado_client=ado)
+    assert ei.value.rc == 1
+    assert ei.value.reason == "exited non-zero"
+    assert ado.posted is None          # <-- nothing posted to the PR
+    assert handle.stopped is True       # teardown still ran
 
 
-async def test_run_review_cap_hit_surfaces_disagreement():
-    claude_r1 = [{"file": "a.py", "line": 10, "claim": "leak", "verdict": "issue"}]
-    codex_r1 = [{"file": "b.py", "line": 20, "claim": "naming", "verdict": "issue"}]
-    # Round 2: they now collide on a.py:10 with different verdicts.
-    claude_r2 = [{"file": "a.py", "line": 10, "claim": "leak", "verdict": "issue"}]
-    codex_r2 = [{"file": "a.py", "line": 10, "claim": "leak", "verdict": "resolved"}]
-
-    handle = FakeHandle(
-        files={
-            _fpath(HarnessType.CLAUDE, 1): _findings_json(claude_r1),
-            _fpath(HarnessType.CODEX, 1): _findings_json(codex_r1),
-            _fpath(HarnessType.CLAUDE, 2): _findings_json(claude_r2),
-            _fpath(HarnessType.CODEX, 2): _findings_json(codex_r2),
-        }
-    )
+async def test_missing_findings_file_aborts_and_does_not_post():
+    # Harness exits 0 but writes no findings file -> protocol failure, not clean.
+    handle = FakeHandle(files={})       # exec defaults to rc=0, stdout=""
     ado = _RecordingAdo()
-    review = await run_review(
+    with pytest.raises(ReviewFailure) as ei:
+        await run_review(_job(), _settings(round_cap=2), runner=FakeRunner(handle), ado_client=ado)
+    assert ei.value.reason == "wrote no findings file"
+    assert ado.posted is None
+    assert handle.stopped is True
+
+
+async def test_unparseable_findings_file_aborts_and_does_not_post():
+    # Bad JSON in the independent (prep) pass -> abort before any battle round.
+    handle = FakeHandle(files={_indep(HarnessType.CLAUDE): "this is not json"})
+    ado = _RecordingAdo()
+    with pytest.raises(ReviewFailure) as ei:
+        await run_review(_job(), _settings(round_cap=2), runner=FakeRunner(handle), ado_client=ado)
+    assert "unparseable" in ei.value.reason
+    assert ado.posted is None
+
+
+async def test_judge_error_aborts_and_does_not_post():
+    # The coordinator judge itself fails -> fail closed, nothing posted.
+    bug = [{"file": "a.py", "line": 1, "claim": "bug", "verdict": "issue"}]
+    handle = FakeHandle(files=_seed(indep=bug, rounds={1: bug}))
+    ado = _RecordingAdo()
+
+    async def boom_judge(left, right, round_no):
+        raise ReviewFailure("coordinator judge blew up", round_no=round_no, reason="judge call failed")
+
+    with pytest.raises(ReviewFailure) as ei:
+        await run_review(
+            _job(), _settings(round_cap=2), runner=FakeRunner(handle),
+            ado_client=ado, judge=boom_judge,
+        )
+    assert ei.value.reason == "judge call failed"
+    assert ado.posted is None
+
+
+async def test_genuine_empty_findings_is_clean_and_posts():
+    # BOTH harnesses ran fine and wrote present, valid, EMPTY findings files
+    # (prep + round 1). Fallback judge converges -> a real clean, which posts.
+    handle = FakeHandle(files=_seed(indep=[], rounds={1: []}))
+    ado = _RecordingAdo()
+    outcome = await run_review(
         _job(), _settings(round_cap=2), runner=FakeRunner(handle), ado_client=ado
     )
-    assert "Unresolved disagreements" in review
-    assert "a.py:10" in review
-    assert "issue" in review and "resolved" in review
+    assert "clean" in outcome.review_md
+    assert outcome.status == "converged"
+    assert ado.posted == outcome.review_md   # a real clean DOES post
     assert handle.stopped is True
-    assert ado.posted is not None
+    # Clean review -> Approve (+10) cast on the PR.
+    assert outcome.vote == 10
+    assert ado.voted == 10
 
 
-async def test_run_review_missing_findings_file_does_not_crash():
-    # No findings files seeded at all -> harness "wrote nothing" every round.
-    handle = FakeHandle(files={})
-    review = await run_review(
-        _job(), _settings(round_cap=2), runner=FakeRunner(handle), ado_client=None, post_back=False
-    )
-    assert "clean" in review
-    assert handle.stopped is True
-
-
-async def test_run_review_uses_reasoner_in_round2():
+async def test_reasoner_frames_each_battle_round():
     calls = []
 
     async def reasoner(structured: str) -> str:
         calls.append(structured)
         return "FRAMED"
 
-    r1a = [{"file": "a.py", "line": 1, "claim": "x", "verdict": "issue"}]
-    r1b = [{"file": "z.py", "line": 9, "claim": "y", "verdict": "issue"}]
-    handle = FakeHandle(
-        files={
-            _fpath(HarnessType.CLAUDE, 1): _findings_json(r1a),
-            _fpath(HarnessType.CODEX, 1): _findings_json(r1b),
-            _fpath(HarnessType.CLAUDE, 2): _findings_json(r1a),
-            _fpath(HarnessType.CODEX, 2): _findings_json(r1b),
-        }
-    )
+    bug = [{"file": "a.py", "line": 1, "claim": "x", "verdict": "issue"}]
+    handle = FakeHandle(files=_seed(indep=bug, rounds={1: bug}))
     await run_review(
-        _job(),
-        _settings(round_cap=2),
-        runner=FakeRunner(handle),
-        ado_client=None,
-        reasoner=reasoner,
-        post_back=False,
+        _job(), _settings(round_cap=1), runner=FakeRunner(handle),
+        ado_client=None, reasoner=reasoner, judge=_judge(False), post_back=False,
     )
-    # Round 2 ran for both harnesses -> reasoner invoked twice.
+    # One battle round, two harnesses -> reasoner invoked once per harness.
     assert len(calls) == 2

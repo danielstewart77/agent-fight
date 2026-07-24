@@ -2,7 +2,12 @@
 {% block title %}Log in — Agent Fight{% endblock %}
 {% block nav %}{% endblock %}
 {% block content %}
-<div class="card" style="max-width: 360px; margin: 80px auto;">
+<div class="brand" style="justify-content: center; font-size: 24px; margin: 64px auto 0;">
+  <img class="boxer" src="/static/boxer.svg" alt="" style="height: 48px;">
+  <span>Agent Fight</span>
+  <img class="boxer flip" src="/static/boxer.svg" alt="" style="height: 48px;">
+</div>
+<div class="card" style="max-width: 360px; margin: 24px auto;">
   <h1>Log in</h1>
   {% if error %}<p class="error">{{ error }}</p>{% endif %}
   <form method="post" action="/login">

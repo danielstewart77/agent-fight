@@ -92,6 +92,12 @@ def parse_pull_request_event(payload: dict, settings: Settings) -> ReviewJob:
     if isinstance(web, dict):
         pr_web_url = web.get("href", "") or ""
 
+    # Source-branch tip commit (best-effort; absent on some payload shapes).
+    src_commit = ""
+    lmsc = resource.get("lastMergeSourceCommit")
+    if isinstance(lmsc, dict):
+        src_commit = str(lmsc.get("commitId") or "")
+
     return ReviewJob(
         event_type=event_type,
         pr_id=pr_id,
@@ -105,6 +111,7 @@ def parse_pull_request_event(payload: dict, settings: Settings) -> ReviewJob:
         organization=settings.ado_organization or "",
         project=project,
         pr_web_url=pr_web_url,
+        source_commit=src_commit,
     )
 
 
@@ -190,6 +197,45 @@ class AdoClient:
         if resp.status_code // 100 != 2:
             raise RuntimeError(f"ADO comment update failed {resp.status_code}: {resp.text[:500]}")
         return "updated"
+
+    async def _reviewer_id(self, settings: Settings, job: ReviewJob) -> str:
+        """The authenticated PAT user's identity id — the reviewer we vote as.
+
+        NOTE: connectionData is a preview-only resource — it 400s on a plain
+        `api-version=7.1` ("must supply -preview"), unlike the GA git endpoints,
+        so this one call uses the preview suffix."""
+        url = (
+            f"https://dev.azure.com/{job.organization}"
+            f"/_apis/connectionData?api-version={ADO_API_VERSION}-preview"
+        )
+        resp = await self._http().get(url, headers=self._headers(settings))
+        if resp.status_code // 100 != 2:
+            raise RuntimeError(f"ADO connectionData failed {resp.status_code}: {resp.text[:300]}")
+        user = resp.json().get("authenticatedUser") or {}
+        rid = user.get("id")
+        if not rid:
+            raise RuntimeError("ADO connectionData returned no authenticatedUser.id")
+        return str(rid)
+
+    async def set_pr_vote(self, settings: Settings, job: ReviewJob, vote: int) -> None:
+        """Cast the PAT user's reviewer vote on the PR (10/5/-5/-10; 0 skips).
+
+        Adds the PAT identity as a reviewer with the given vote (idempotent —
+        PUT replaces any prior vote). ADO vote values: 10 approve, 5 approve with
+        suggestions, 0 no vote, -5 wait for author, -10 reject."""
+        if not settings.ado_pat:
+            raise AdoNotConfigured("ado_pat is not configured — set it at /admin/settings")
+        if not vote:
+            return  # 0 = no vote; nothing to cast
+        reviewer_id = await self._reviewer_id(settings, job)
+        url = (
+            f"https://dev.azure.com/{job.organization}/{job.project}"
+            f"/_apis/git/repositories/{job.repo_id}"
+            f"/pullRequests/{job.pr_id}/reviewers/{reviewer_id}?api-version={ADO_API_VERSION}"
+        )
+        resp = await self._http().put(url, headers=self._headers(settings), json={"vote": vote})
+        if resp.status_code // 100 != 2:
+            raise RuntimeError(f"ADO vote failed {resp.status_code}: {resp.text[:300]}")
 
     async def aclose(self) -> None:
         if self._client is not None and self._owns_client:

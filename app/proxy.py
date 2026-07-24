@@ -31,6 +31,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.orm import Settings
+from app.review.models import Usage
 
 logger = logging.getLogger("agent_fight.proxy")
 
@@ -115,11 +116,33 @@ class ProxyClient:
         model: Optional[str] = None,
         max_tokens: int = 4096,
     ) -> str:
-        """One completion in the configured flavor; returns the text.
+        """One completion in the configured flavor; returns just the text.
 
-        - anthropic: POST /v1/messages, top-level `system`, parse content[].text.
-        - openai:    POST /v1/chat/completions, `system` as a system-role
-                     message, parse choices[0].message.content.
+        Thin wrapper over `complete_with_usage` for callers that don't need the
+        token accounting (kept so existing callers/tests are unchanged)."""
+        text, _ = await self.complete_with_usage(
+            messages=messages, system=system, model=model, max_tokens=max_tokens
+        )
+        return text
+
+    async def complete_with_usage(
+        self,
+        *,
+        messages: list[dict],
+        system: Optional[str] = None,
+        model: Optional[str] = None,
+        max_tokens: int = 4096,
+    ) -> tuple[str, Usage]:
+        """One completion in the configured flavor; returns `(text, Usage)`.
+
+        - anthropic: POST /v1/messages, top-level `system`, parse content[].text;
+                     usage from `usage.{input,output,cache_*}_tokens`.
+        - openai:    POST /v1/chat/completions, `system` as a system-role message,
+                     parse choices[0].message.content; usage from
+                     `usage.{prompt,completion}_tokens`.
+
+        The proxy does not report a dollar cost for coordinator calls, so
+        `Usage.cost_usd` is left None here.
         """
         use_model = model or self._model
         if not use_model:
@@ -135,9 +158,15 @@ class ProxyClient:
                 raise ProxyError(f"proxy returned {resp.status_code}: {resp.text[:500]}")
             try:
                 data = resp.json()
-                return data["choices"][0]["message"]["content"] or ""
+                text = data["choices"][0]["message"]["content"] or ""
             except (ValueError, KeyError, IndexError, TypeError) as exc:
                 raise ProxyError(f"malformed proxy response: {exc}") from exc
+            u = data.get("usage") or {}
+            usage = Usage(
+                input_tokens=int(u.get("prompt_tokens") or 0),
+                output_tokens=int(u.get("completion_tokens") or 0),
+            )
+            return text, usage
 
         body = {"model": use_model, "max_tokens": max_tokens, "messages": messages}
         if system is not None:
@@ -152,7 +181,14 @@ class ProxyClient:
             parts = [b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"]
         except (ValueError, AttributeError) as exc:
             raise ProxyError(f"malformed proxy response: {exc}") from exc
-        return "".join(parts)
+        u = data.get("usage") or {}
+        usage = Usage(
+            input_tokens=int(u.get("input_tokens") or 0),
+            output_tokens=int(u.get("output_tokens") or 0),
+            cache_read_tokens=int(u.get("cache_read_input_tokens") or 0),
+            cache_creation_tokens=int(u.get("cache_creation_input_tokens") or 0),
+        )
+        return "".join(parts), usage
 
     async def aclose(self) -> None:
         if self._client is not None and self._owns_client:

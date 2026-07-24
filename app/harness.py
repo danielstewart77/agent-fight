@@ -26,7 +26,7 @@ import json
 
 from app.orm import Settings
 from app.proxy import proxy_root
-from app.review.models import Event, HarnessType
+from app.review.models import Event, HarnessType, Usage
 
 CODEX_PROVIDER_ID = "azure_proxy"
 
@@ -147,6 +147,89 @@ def parse_line(harness: HarnessType, line: str) -> Event | None:
     if harness is HarnessType.CODEX:
         return _codex_event(obj)
     return Event(kind="unknown", raw=obj)
+
+
+def extract_usage(harness: HarnessType, stdout: str) -> Usage:
+    """Sum token (and, for Claude, cost) usage from a harness's stream-json.
+
+    Claude emits a terminal ``{"type":"result", "usage":{...},
+    "total_cost_usd":..}`` line; Codex emits ``{"type":"turn.completed",
+    "usage":{...}}``. Field names differ (verified against live CLI output during
+    triage): Codex uses ``cached_input_tokens`` / ``cache_write_input_tokens``
+    where Claude uses ``cache_read_input_tokens`` / ``cache_creation_input_tokens``.
+
+    Matching events are summed across repeats (multiple turns/results). Blank,
+    non-JSON, and unrelated lines are ignored — usage accounting must never crash
+    a run. Returns an empty ``Usage`` when nothing is found (e.g. the harness
+    exited before reporting).
+    """
+    inp = out = cache_read = cache_creation = 0
+    cost: float | None = None
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(obj, dict):
+            continue
+        typ = obj.get("type")
+        usage = obj.get("usage")
+        if not isinstance(usage, dict):
+            continue
+
+        if harness is HarnessType.CLAUDE and typ == "result":
+            inp += int(usage.get("input_tokens") or 0)
+            out += int(usage.get("output_tokens") or 0)
+            cache_read += int(usage.get("cache_read_input_tokens") or 0)
+            cache_creation += int(usage.get("cache_creation_input_tokens") or 0)
+            c = obj.get("total_cost_usd")
+            if isinstance(c, (int, float)):
+                cost = (cost or 0.0) + float(c)
+        elif harness is HarnessType.CODEX and typ in ("turn.completed", "turn_complete"):
+            inp += int(usage.get("input_tokens") or 0)
+            out += int(usage.get("output_tokens") or 0)
+            cache_read += int(usage.get("cached_input_tokens") or 0)
+            cache_creation += int(usage.get("cache_write_input_tokens") or 0)
+
+    return Usage(
+        input_tokens=inp,
+        output_tokens=out,
+        cache_read_tokens=cache_read,
+        cache_creation_tokens=cache_creation,
+        cost_usd=cost,
+    )
+
+
+def harness_error_line(harness: HarnessType, stdout: str) -> str:
+    """Best-effort extraction of the harness's own error message from its
+    stream-json stdout. Both Codex ({"type":"error"/"stream_error",...}) and
+    Claude (a result event with is_error, or an error event) report failures on
+    stdout, not stderr — so on a non-zero exit this is where the reason is.
+    Returns the last error message found, capped, or "" if none."""
+    last = ""
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(obj, dict):
+            continue
+        typ = str(obj.get("type") or "").lower()
+        if "error" in typ:
+            msg = obj.get("message") or obj.get("error") or ""
+            if isinstance(msg, dict):
+                msg = msg.get("message") or json.dumps(msg)
+            if msg:
+                last = str(msg)
+        elif typ == "result" and obj.get("is_error"):
+            last = str(obj.get("result") or obj.get("api_error_status") or "result error")
+    return last[:500]
 
 
 def harness_env(harness: HarnessType, settings: Settings) -> dict[str, str]:
