@@ -183,3 +183,115 @@ async def test_post_pr_review_raises_on_non_2xx():
     client = AdoClient(client=httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(403, text="no"))))
     with pytest.raises(RuntimeError):
         await client.post_pr_review(_settings(ado_pat="p"), job, "x")
+
+
+# --- PR context: what the reviewers are handed ------------------------------ #
+
+
+def _pr_context_handler(*, threads, work_items_status=200):
+    """MockTransport handler serving the PR detail, threads, and work items."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "/pullRequests/42/workitems" in url:
+            return httpx.Response(work_items_status, json={"value": [{"id": "13766"}]})
+        if "/wit/workitems" in url:
+            return httpx.Response(200, json={"value": [{
+                "id": 13766,
+                "fields": {
+                    "System.WorkItemType": "Bug",
+                    "System.Title": "Add more submissions to the tab",
+                    "System.Description": "<div>Rows must <b>open</b> the modal.</div>",
+                },
+            }]})
+        if "/threads" in url:
+            return httpx.Response(200, json={"value": threads})
+        return httpx.Response(200, json={
+            "title": "Add Operator Change support",
+            "description": "Enable navigation for Operator Change submissions.",
+            "status": "active",
+            "createdBy": {"displayName": "Mohamed, Aladdin"},
+        })
+    return handler
+
+
+async def test_fetch_pr_context_includes_description_and_work_items():
+    job = parse_pull_request_event(sample_ado_payload(), _settings())
+    client = AdoClient(client=httpx.AsyncClient(
+        transport=httpx.MockTransport(_pr_context_handler(threads=[]))))
+    md = await client.fetch_pr_context(_settings(ado_pat="p"), job)
+
+    assert "Add Operator Change support" in md
+    assert "Enable navigation for Operator Change submissions." in md
+    assert "Mohamed, Aladdin" in md
+    assert "Bug #13766" in md
+    # Work-item HTML is flattened, not dumped raw.
+    assert "Rows must open the modal." in md and "<b>" not in md
+    assert "_(no comments yet)_" in md
+
+
+async def test_fetch_pr_context_keeps_the_authors_rebuttal():
+    """The whole point: an author who refuted our last review must be heard by
+    the next one. Their reply is a child comment on our own thread."""
+    threads = [{
+        "id": 15088,
+        "status": "fixed",
+        "threadContext": {"filePath": "/src/app.ts", "rightFileStart": {"line": 17}},
+        "comments": [
+            {"id": 1, "parentCommentId": 0, "commentType": "text",
+             "author": {"displayName": "Build Bot"},
+             "publishedDate": "2026-07-27T23:27:58Z",
+             "content": "**Agent Fight - consensus review** - the modal is create-only."},
+            {"id": 2, "parentCommentId": 1, "commentType": "text",
+             "author": {"displayName": "Mohamed, Aladdin"},
+             "publishedDate": "2026-07-28T00:11:58Z",
+             "content": "Your reviewer was wrong: the service resolves it by wellboreId."},
+            {"id": 3, "commentType": "system", "content": "Aladdin updated the PR"},
+        ],
+    }]
+    job = parse_pull_request_event(sample_ado_payload(), _settings())
+    client = AdoClient(client=httpx.AsyncClient(
+        transport=httpx.MockTransport(_pr_context_handler(threads=threads))))
+    md = await client.fetch_pr_context(_settings(ado_pat="p"), job)
+
+    assert "Your reviewer was wrong: the service resolves it by wellboreId." in md
+    assert "Mohamed, Aladdin** (reply)" in md
+    # Our own prior review is flagged as ours, so replies read as answers to it.
+    assert "agent-fight's own previous review" in md
+    assert "`/src/app.ts`:17" in md
+    # System chatter is dropped.
+    assert "updated the PR" not in md
+    assert "Comment threads (1)" in md
+
+
+async def test_fetch_pr_context_survives_missing_work_items():
+    """Boards may be off or the PAT may lack scope — enrichment, not a gate."""
+    job = parse_pull_request_event(sample_ado_payload(), _settings())
+    client = AdoClient(client=httpx.AsyncClient(transport=httpx.MockTransport(
+        _pr_context_handler(threads=[], work_items_status=403))))
+    md = await client.fetch_pr_context(_settings(ado_pat="p"), job)
+    assert "Add Operator Change support" in md
+    assert "Linked work items" not in md
+
+
+async def test_fetch_pr_context_fails_closed_when_threads_unreadable():
+    """Losing the conversation is not a degraded review, it is a broken one."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "/threads" in str(request.url):
+            return httpx.Response(500, text="boom")
+        return httpx.Response(200, json={"title": "t", "description": "d"})
+
+    job = parse_pull_request_event(sample_ado_payload(), _settings())
+    client = AdoClient(client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    with pytest.raises(RuntimeError):
+        await client.fetch_pr_context(_settings(ado_pat="p"), job)
+
+
+async def test_pr_api_base_encodes_a_project_with_spaces():
+    """The harnesses curl this URL; a raw space breaks the shell command."""
+    from app.ado import pr_api_base
+
+    payload = sample_ado_payload()
+    payload["resource"]["repository"]["project"] = {"name": "IT Development"}
+    job = parse_pull_request_event(payload, _settings())
+    assert "IT%20Development" in pr_api_base(job)
+    assert " " not in pr_api_base(job)

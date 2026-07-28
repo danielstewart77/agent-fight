@@ -57,7 +57,7 @@ async def test_run_and_record_persists_success_with_usage(session):
 
     review = await run_and_record(
         session, _job(), _settings(round_cap=3),
-        runner=FakeRunner(handle), ado_client=ado, reasoner=None, judge=None,
+        runner=FakeRunner(handle), ado_client=ado, judge=None,
     )
 
     # Row finalized to converged with metrics (battle rounds only; prep uncounted).
@@ -134,7 +134,7 @@ async def test_run_and_record_marks_failed_on_error(session):
     with pytest.raises(RuntimeError):
         await run_and_record(
             session, _job(), _settings(),
-            runner=BoomRunner(), ado_client=None, reasoner=None,
+            runner=BoomRunner(), ado_client=None,
         )
 
     review = (await session.execute(select(Review))).scalars().one()
@@ -161,7 +161,7 @@ async def test_run_and_record_harness_failure_never_posts_but_records(session):
     with pytest.raises(ReviewFailure):
         await run_and_record(
             session, _job(), _settings(round_cap=3),
-            runner=FakeRunner(handle), ado_client=ado, reasoner=None,
+            runner=FakeRunner(handle), ado_client=ado,
         )
 
     review = (await session.execute(select(Review))).scalars().one()
@@ -177,3 +177,34 @@ async def test_run_and_record_harness_failure_never_posts_but_records(session):
         )
     ).scalars().all()
     assert any(r.role == "claude" and r.input_tokens == 100 for r in rows)
+
+
+async def test_run_and_record_persists_every_agents_raw_findings(session):
+    """The audit trail: what each agent actually wrote, kept beside the comment
+    it produced. Added after a review published an approving note as a
+    'concern' and the only evidence left was the judge's one-line summary."""
+    from app.container import ExecResult
+    from app.orm import ReviewFinding
+
+    same = [{"file": "a.py", "line": 10, "claim": "bug", "verdict": "issue"}]
+    handle = FakeHandle(
+        files=_seed(indep=same, rounds={1: same}),
+        exec_results={"claude": ExecResult(rc=0, stdout=""),
+                      "codex": ExecResult(rc=0, stdout="")},
+    )
+    review = await run_and_record(
+        session, _job(), _settings(round_cap=3),
+        runner=FakeRunner(handle), ado_client=_RecordingAdo(), judge=None,
+    )
+
+    rows = (
+        await session.execute(
+            select(ReviewFinding).where(ReviewFinding.review_id == review.id)
+        )
+    ).scalars().all()
+    # Both harnesses, round 0 (independent) and round 1 (fight).
+    assert {(r.role, r.round_no) for r in rows} == {
+        ("claude", 0), ("codex", 0), ("claude", 1), ("codex", 1),
+    }
+    # Stored verbatim, not re-serialized from the parse.
+    assert all('"claim": "bug"' in r.raw for r in rows)

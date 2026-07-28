@@ -87,4 +87,21 @@
   <p class="muted">Nothing was posted (run did not complete).</p>
   {% endif %}
 </div>
+
+<div class="card">
+  <h2>What each agent wrote</h2>
+  <p class="muted">
+    The raw findings file each harness produced, round by round — round 0 is the
+    blind independent review, 1+ are fight rounds. This is the source the posted
+    comment above was built from.
+  </p>
+  {% if not findings %}
+  <p class="muted">No findings files recorded for this run.</p>
+  {% else %}
+  {% for f in findings %}
+  <h3>{{ f.role }} — round {{ f.round_no }}</h3>
+  <pre class="review">{{ f.raw }}</pre>
+  {% endfor %}
+  {% endif %}
+</div>
 {% endblock %}

@@ -61,7 +61,7 @@ async def review_detail(
     review = (
         await session.execute(
             select(Review)
-            .options(selectinload(Review.token_usage))
+            .options(selectinload(Review.token_usage), selectinload(Review.findings))
             .where(Review.id == review_id)
         )
     ).scalar_one_or_none()
@@ -74,5 +74,6 @@ async def review_detail(
             "r": review,
             "usage": review.token_usage,   # already ordered by round_no, role
             "tokens": _totals(review.token_usage),
+            "findings": review.findings,   # ordered by round_no, role
         },
     )

@@ -196,6 +196,12 @@ class Review(Base):
         order_by="ReviewTokenUsage.round_no, ReviewTokenUsage.role",
     )
 
+    findings: Mapped[list["ReviewFinding"]] = relationship(
+        back_populates="review",
+        cascade="all, delete-orphan",
+        order_by="ReviewFinding.round_no, ReviewFinding.role",
+    )
+
     __table_args__ = (
         CheckConstraint(
             "status IN ('running','converged','capped','failed')",
@@ -237,5 +243,45 @@ class ReviewTokenUsage(Base):
         CheckConstraint(
             "role IN ('claude','codex','coordinator')",
             name="CK_review_token_usage_role",
+        ),
+    )
+
+
+class ReviewFinding(Base):
+    """One harness's raw findings file for one round, stored verbatim.
+
+    The audit trail behind the posted comment. `final_review_md` records what we
+    said; this records what each agent actually wrote — the verdicts, severities
+    and claim text that produced it. Added after a review published an approving
+    note as a "concern": the container is torn down at the end of a run, so
+    without this the only way to explain a bad comment is to infer it from the
+    judge's one-line summary.
+
+    `raw` is the file's exact bytes (JSON as emitted, not re-serialized from the
+    parse), so a malformed or surprising field is still visible.
+    """
+
+    __tablename__ = "review_findings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    review_id: Mapped[int] = mapped_column(
+        ForeignKey("reviews.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+
+    role: Mapped[str] = mapped_column(Unicode(16), nullable=False)
+    # 0 is the blind independent pass; 1..N are fight rounds.
+    round_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    raw: Mapped[str] = mapped_column(UnicodeText, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now()
+    )
+
+    review: Mapped["Review"] = relationship(back_populates="findings")
+
+    __table_args__ = (
+        CheckConstraint(
+            "role IN ('claude','codex')",
+            name="CK_review_findings_role",
         ),
     )

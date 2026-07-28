@@ -55,9 +55,15 @@ class ReviewJob:
 class Finding:
     """One structured review finding — the source of truth for convergence.
 
-    `verdict` is `issue` in round 1; in round 2+ an agent re-states each item it
-    is responding to as `agree` / `disagree` / `revised` / `resolved`. `line`
-    is 1-indexed; 0 means file-level with no specific line.
+    `verdict` is `issue` in the independent round; in a fight round an agent
+    re-states each item it is responding to as `agree` / `disagree` / `revised`
+    / `resolved`. `line` is 1-indexed; 0 means file-level with no specific line.
+
+    There is deliberately NO confidence score. A self-reported number nobody can
+    check is decoration — every finding in the false-positive that motivated this
+    design shipped at "confidence 100". `evidence` replaces it: the agent must
+    name the code it actually read to support the consequence it is claiming, and
+    the rival gets to attack that.
     """
 
     file: str
@@ -65,11 +71,14 @@ class Finding:
     claim: str
     severity: str = "medium"
     verdict: str = "issue"
-    # 0-100 confidence the issue is real (pr-review-toolkit convention); items
-    # below the reporting threshold are meant to be filtered out by the harness.
-    confidence: int = 100
     # A concrete fix suggestion, shown in the final comment.
     suggestion: str = ""
+    # The files/lines the agent read that prove the claimed consequence.
+    evidence: str = ""
+    # The agent's argument in a fight round: why it agrees, or why the rival is
+    # wrong. Never dropped — a rebuttal is the whole point of the fight, and it
+    # is rendered verbatim for any item that stays contested.
+    response: str = ""
 
 
 @dataclass(frozen=True)
@@ -142,11 +151,26 @@ class Usage:
 
 
 @dataclass(frozen=True)
+class RawFindings:
+    """The exact bytes one harness wrote in one round, kept verbatim.
+
+    Persisted per review so a wrong or baffling posted comment can be traced to
+    what the agents actually emitted — verdicts, severities and all. Without it,
+    diagnosing bad output means inferring it from the judge's prose after the
+    container is gone.
+    """
+
+    role: str
+    round_no: int
+    raw: str
+
+
+@dataclass(frozen=True)
 class RoleRoundUsage:
     """`Usage` attributed to one role in one round of the consensus loop.
 
-    `role` is a harness value (`claude`/`codex`) or `coordinator` for the
-    cross-exposure reframing calls. `round_no` is 1-indexed.
+    `role` is a harness value (`claude`/`codex`) or `coordinator` for the judge's
+    per-round ruling. `round_no` is 1-indexed (0 = the independent prep pass).
     """
 
     role: str
@@ -156,19 +180,17 @@ class RoleRoundUsage:
 
 @dataclass(frozen=True)
 class CoordinatorDecision:
-    """The coordinator LLM's judgment after one battle round.
+    """The judge's ruling after one fight round.
 
-    Replaces the string-diff `ConvergenceResult` on the production path: the
-    coordinator reads both agents' latest findings and decides, semantically,
-    which findings they AGREE are real issues, which remain a genuine open
-    DISPUTE, and whether the debate has converged (no dispute worth another
-    round). The final review is authored from the last decision — `agreed` plus
-    `disagreed`. `converged` gates the loop; the round cap bounds it.
+    The judge referees; it does NOT review. It never sees the code and never
+    writes, merges, or rewrites a finding — the agents' own words go to the pull
+    request verbatim. Its only calls are whether the fight is settled
+    (`converged`, which gates the loop; the round cap bounds it) and what vote to
+    cast. The review's content is derived from the agents' findings by
+    `coordinator.convergence`.
     """
 
     converged: bool
-    agreed: list[Finding] = field(default_factory=list)
-    disagreed: list[Disagreement] = field(default_factory=list)
     summary: str = ""
     # Recommended Azure DevOps reviewer vote based on the findings — one of
     # 10 (approve), 5 (approve w/ suggestions), -5 (wait for author),
@@ -227,3 +249,6 @@ class ReviewOutcome:
     usage: list[RoleRoundUsage] = field(default_factory=list)
     vote: Optional[int] = None       # ADO reviewer vote cast for this review
     vote_reason: str = ""
+    # Every harness's raw findings file, every round — the audit trail behind
+    # the posted comment.
+    raw_findings: list[RawFindings] = field(default_factory=list)

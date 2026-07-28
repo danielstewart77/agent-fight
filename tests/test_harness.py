@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+
 import pytest
 
 from app.harness import build_argv, harness_env, parse_line, resolve_harness
@@ -129,3 +131,35 @@ def test_codex_config_toml():
     assert "[model_providers.azure_proxy]" in toml
     assert 'wire_api = "responses"' in toml
     assert 'env_key = "OPENAI_API_KEY"' in toml
+
+
+# --- PR access for the reviewers -------------------------------------------- #
+
+
+def test_ado_env_gives_the_harness_the_pr_endpoint():
+    from app.ado import parse_pull_request_event
+    from app.harness import ado_env
+    from tests.conftest import sample_ado_payload
+
+    s = Settings(id=1, round_cap=3, clone_credential_kind="token")
+    s.ado_organization = "contoso"
+    s.ado_pat = "my-pat"
+    job = parse_pull_request_event(sample_ado_payload(), s)
+
+    env = ado_env(job, s)
+    assert env["ADO_AUTH_HEADER"] == "Basic " + base64.b64encode(b":my-pat").decode()
+    assert env["ADO_PR_API"].endswith("/pullRequests/42")
+    assert env["ADO_API_VERSION"] == "7.1"
+
+
+def test_ado_env_empty_without_a_pat():
+    """No PAT -> no endpoint. The harness still has the diff, the repo, and the
+    PR context file."""
+    from app.ado import parse_pull_request_event
+    from app.harness import ado_env
+    from tests.conftest import sample_ado_payload
+
+    s = Settings(id=1, round_cap=3, clone_credential_kind="token")
+    s.ado_organization = "contoso"
+    s.ado_pat = None
+    assert ado_env(parse_pull_request_event(sample_ado_payload(), s), s) == {}

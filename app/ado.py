@@ -1,9 +1,11 @@
-"""Azure DevOps: parse the inbound PR service-hook, post the review back.
+"""Azure DevOps: parse the inbound PR service-hook, read the PR, post back.
 
 `parse_pull_request_event` is pure — it turns the ADO service-hook JSON for a
 `git.pullrequest.created` / `git.pullrequest.updated` event into a `ReviewJob`.
-`AdoClient.post_pr_review` is the one side-effect: it posts the coordinator's
-final review as a pull-request thread comment using the stored PAT.
+The side effects are `AdoClient.fetch_pr_context` (read the PR's description and
+every comment thread, including the author's replies to our previous review) and
+`post_or_update_pr_review` / `set_pr_vote` (write the result back), both using
+the stored PAT.
 
 ASSUMPTIONS (isolated here — confirm against the target org / a captured live
 payload): the `resource.*` field paths below, that `remoteUrl` is the clone
@@ -14,12 +16,18 @@ endpoint, and PAT Basic-auth (`base64(":" + pat)`).
 from __future__ import annotations
 
 import base64
+import html
+import logging
+import re
 from typing import Optional
+from urllib.parse import quote
 
 import httpx
 
 from app.orm import Settings
 from app.review.models import ReviewJob
+
+logger = logging.getLogger("agent_fight.ado")
 
 SUPPORTED_EVENTS = ("git.pullrequest.created", "git.pullrequest.updated")
 ADO_API_VERSION = "7.1"
@@ -115,6 +123,35 @@ def parse_pull_request_event(payload: dict, settings: Settings) -> ReviewJob:
     )
 
 
+def pr_api_base(job: ReviewJob) -> str:
+    """The REST base for this PR, path-encoded so it is safe in a shell.
+
+    Shared by the client below and by the URL handed to the review harnesses
+    (see harness.ado_env) so both hit exactly the same resource. Project names
+    routinely contain spaces ("IT Development"), which httpx tolerates but
+    `curl` inside the container does not."""
+    org = quote(job.organization or "", safe="")
+    project = quote(job.project or "", safe="")
+    return (
+        f"https://dev.azure.com/{org}/{project}"
+        f"/_apis/git/repositories/{job.repo_id}/pullRequests/{job.pr_id}"
+    )
+
+
+def basic_auth_header(pat: str) -> str:
+    """ADO PAT Basic-auth header value: base64(":" + pat)."""
+    return f"Basic {base64.b64encode(f':{pat}'.encode()).decode()}"
+
+
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _detag(text: str) -> str:
+    """ADO work-item descriptions are HTML; flatten to something readable."""
+    text = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</li>", "\n", text or "")
+    return html.unescape(_TAG_RE.sub("", text)).strip()
+
+
 class AdoNotConfigured(RuntimeError):
     """The ADO PAT needed to post back is unset."""
 
@@ -134,21 +171,138 @@ class AdoClient:
 
     @staticmethod
     def _basic_auth(pat: str) -> str:
-        token = base64.b64encode(f":{pat}".encode()).decode()
-        return f"Basic {token}"
+        return basic_auth_header(pat)
 
     def _threads_url(self, job: ReviewJob, suffix: str = "") -> str:
-        return (
-            f"https://dev.azure.com/{job.organization}/{job.project}"
-            f"/_apis/git/repositories/{job.repo_id}"
-            f"/pullRequests/{job.pr_id}/threads{suffix}?api-version={ADO_API_VERSION}"
-        )
+        return f"{pr_api_base(job)}/threads{suffix}?api-version={ADO_API_VERSION}"
 
     def _headers(self, settings: Settings) -> dict[str, str]:
         return {
             "Authorization": self._basic_auth(settings.ado_pat),
             "content-type": "application/json",
         }
+
+    async def _get_json(self, settings: Settings, url: str, what: str) -> dict:
+        resp = await self._http().get(url, headers=self._headers(settings))
+        if resp.status_code // 100 != 2:
+            raise RuntimeError(f"ADO {what} failed {resp.status_code}: {resp.text[:300]}")
+        return resp.json()
+
+    async def _work_items_section(self, settings: Settings, job: ReviewJob) -> list[str]:
+        """Linked work items with title + description, or [] if unavailable.
+
+        Best-effort: work items are enrichment, and a project without the Boards
+        service (or a PAT lacking work-item scope) must not fail a review."""
+        try:
+            refs = await self._get_json(
+                settings,
+                f"{pr_api_base(job)}/workitems?api-version={ADO_API_VERSION}",
+                "PR work items",
+            )
+            ids = [str(w.get("id")) for w in refs.get("value", []) if w.get("id")]
+            if not ids:
+                return []
+            org = quote(job.organization or "", safe="")
+            detail = await self._get_json(
+                settings,
+                f"https://dev.azure.com/{org}/_apis/wit/workitems"
+                f"?ids={','.join(ids)}"
+                "&fields=System.WorkItemType,System.Title,System.Description"
+                f"&api-version={ADO_API_VERSION}",
+                "work item detail",
+            )
+        except Exception as exc:  # noqa: BLE001 - enrichment only
+            logger.warning("PR %s: could not read linked work items: %s", job.pr_id, exc)
+            return []
+
+        lines = ["## Linked work items", ""]
+        for item in detail.get("value", []):
+            fields = item.get("fields") or {}
+            kind = fields.get("System.WorkItemType") or "Work item"
+            lines.append(f"### {kind} #{item.get('id')} — {fields.get('System.Title') or ''}")
+            body = _detag(fields.get("System.Description") or "")
+            lines.append(body or "_(no description)_")
+            lines.append("")
+        return lines
+
+    async def fetch_pr_context(self, settings: Settings, job: ReviewJob) -> str:
+        """The whole pull request as markdown, for the reviewers to read.
+
+        Title, description, linked work items, and EVERY comment thread —
+        including our own previous review and, crucially, the author's replies
+        to it. A human rebuttal ("your reviewer was wrong, here is why") is
+        evidence, and re-posting a finding the author already refuted is the
+        worst thing this service can do. The reviewers can also hit the live PR
+        API themselves (see harness.ado_env); this file is the guarantee that
+        they cannot miss the conversation even if they never call it.
+
+        The PR and its threads are required — a failure here fails the review
+        (fail-closed, same as any other missing input). Work items are optional.
+        """
+        if not settings.ado_pat:
+            raise AdoNotConfigured("ado_pat is not configured — set it at /admin/settings")
+
+        base = pr_api_base(job)
+        pr = await self._get_json(settings, f"{base}?api-version={ADO_API_VERSION}", "PR detail")
+        threads = await self._get_json(
+            settings, f"{base}/threads?api-version={ADO_API_VERSION}", "PR thread list"
+        )
+
+        created_by = (pr.get("createdBy") or {}).get("displayName") or "unknown"
+        lines = [
+            f"# Pull request !{job.pr_id} — {pr.get('title') or ''}",
+            "",
+            f"- Repository: `{job.repo_name}` ({job.organization} / {job.project})",
+            f"- Branch: `{job.source_branch}` -> `{job.target_branch}`",
+            f"- Author: {created_by}",
+            f"- Status: {pr.get('status') or 'unknown'}",
+        ]
+        if job.pr_web_url:
+            lines.append(f"- Web: {job.pr_web_url}")
+        lines += [
+            f"- REST base: `{base}` (append e.g. `/threads?api-version={ADO_API_VERSION}`)",
+            "",
+            "## Description",
+            "",
+            (pr.get("description") or "_(no description)_").strip(),
+            "",
+        ]
+        lines += await self._work_items_section(settings, job)
+
+        rendered: list[str] = []
+        thread_count = 0
+        for thread in threads.get("value", []):
+            comments = [
+                c for c in (thread.get("comments") or [])
+                if (c.get("commentType") or "text") != "system"
+            ]
+            if not comments:
+                continue
+            thread_count += 1
+            ctx = thread.get("threadContext") or {}
+            where = ctx.get("filePath") or ""
+            line_no = ((ctx.get("rightFileStart") or {}) or {}).get("line")
+            anchor = f" on `{where}`" + (f":{line_no}" if line_no else "") if where else ""
+            head = f"### Thread {thread.get('id')}{anchor} (status: {thread.get('status') or 'active'})"
+            if any(REVIEW_MARKER in (c.get("content") or "") for c in comments):
+                head += (
+                    "\n\n> This is agent-fight's own previous review of this pull "
+                    "request. Any replies below are the author answering it — treat "
+                    "them as evidence, not as noise."
+                )
+            rendered.append(head)
+            for c in comments:
+                who = (c.get("author") or {}).get("displayName") or "unknown"
+                when = c.get("publishedDate") or ""
+                reply = " (reply)" if c.get("parentCommentId") else ""
+                rendered.append(f"\n**{who}**{reply} — {when}\n")
+                rendered.append((c.get("content") or "").strip())
+            rendered.append("")
+
+        lines.append(f"## Comment threads ({thread_count})")
+        lines.append("")
+        lines += rendered or ["_(no comments yet)_"]
+        return "\n".join(lines).rstrip() + "\n"
 
     async def post_pr_review(self, settings: Settings, job: ReviewJob, review_markdown: str) -> None:
         """Create a new PR thread with the review (with the header/marker)."""

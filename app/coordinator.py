@@ -1,25 +1,25 @@
-"""The round-loop coordinator: independent review, cross-exposure debate,
-convergence tracking, and inclusive final synthesis.
+"""The fight loop: independent review, then rounds of argument over the code.
 
-Implements the core loop from plans/code-review-consensus.md:
+  Round 0    — each harness reviews the diff blind, with the full repo and the
+               pull request in front of it, and writes its own findings file.
+  Round 1..N — each harness is handed its own findings, the rival's findings
+               VERBATIM, and every item still open, and is told to go back to
+               the code and settle it: agree, disagree with proof, revise, or
+               withdraw. Same container, same checkout — a fight round is a full
+               re-review, not a vote on someone else's summary.
+  Each round — the two latest findings files are diffed item by item (same file,
+               same line) into agreed / disputed / unanswered, and a judge rules
+               on whether the fight is over.
+  Terminate  — converged, or the configurable round cap. No tiebreak: the final
+               review is the union of every agreed item, every unresolved
+               dispute (both sides quoted), and every one-sided concern.
 
-  Round 1  — each harness reviews the diff blind, writing its own findings file.
-  Round 2+ — the coordinator builds a per-harness prompt containing that
-             harness's own prior findings plus the other's, delivered
-             conversationally (reframed by the coordinator, a reasoning agent),
-             and each harness writes its next findings file.
-  Each round — diff the two latest files item by item (same file, same line).
-             Matching verdicts get pulled into a running consensus the
-             coordinator alone owns; disagreements carry forward.
-  Terminate — converged, or the configurable round cap. No human tiebreak: the
-             final review is the inclusive union of every agreed item plus every
-             distinct unresolved concern, with each disagreement surfaced.
+The judge referees; it does not review. It never sees the code and never
+rewrites a finding — what the agents wrote is what the pull request gets.
 
-The pure functions (`parse_findings`, `convergence`, `build_cross_exposure_input`,
-`synthesize_final_review`) hold the logic and are fully unit-testable. Only the
-natural-language reframing of a cross-exposure prompt goes through `reasoner`
-(backed by the proxy in production, a stub in tests), and only `run_review`
-touches the container.
+The pure functions (`parse_findings`, `convergence`, `build_independent_prompt`,
+`build_fight_prompt`, `synthesize_final_review`) hold the logic and are fully
+unit-testable; only `run_review` touches the container.
 """
 
 from __future__ import annotations
@@ -29,14 +29,18 @@ import logging
 from typing import Awaitable, Callable, Optional, Union
 
 from app.container import (
+    DIFF_PATH,
     FINDINGS_DIR,
+    PR_CONTEXT_PATH,
     WORKDIR,
     ContainerRunner,
     compute_diff,
     prepare_repo,
     provision_harnesses,
+    write_pr_context,
 )
 from app.harness import (
+    ado_env,
     build_argv,
     extract_usage,
     harness_env,
@@ -52,6 +56,7 @@ from app.review.models import (
     HarnessType,
     ReviewFailure,
     ReviewJob,
+    RawFindings,
     ReviewOutcome,
     RoleRoundUsage,
     Usage,
@@ -66,17 +71,18 @@ logger = logging.getLogger("agent_fight.coordinator")
 # block the run forever).
 HARNESS_TIMEOUT = 900.0
 
-# A reasoner turns a structured cross-exposure input into conversational prose.
-# It may return just the prose (tests / passthrough) or, in production, a
-# (prose, Usage) pair so the coordinator's own token spend is accounted for.
-Reasoner = Callable[[str], Awaitable[Union[str, "tuple[str, Optional[Usage]]"]]]
+# How much of the diff to inline in the round-0 prompt. Past this the prompt
+# points at DIFF_PATH instead — the whole diff is always on disk in the
+# container, and the agent has the repo besides.
+MAX_INLINE_DIFF = 120_000
 
-# A judge reads both agents' latest findings after a battle round and returns a
-# `CoordinatorDecision` (optionally paired with the coord LLM's `Usage`). The
+# A judge reads both agents' latest findings after a fight round and rules on
+# whether the fight is over (plus the reviewer vote), optionally paired with the
+# coord LLM's `Usage`. It is handed no code and authors no findings. The
 # production judge is an LLM (see runner._proxy_judge); the default is a
 # deterministic fallback (see `_fallback_judge`).
 Judge = Callable[
-    [list["Finding"], list["Finding"], int],
+    [list["Finding"], list["Finding"], int, int],
     Awaitable[Union["CoordinatorDecision", "tuple[CoordinatorDecision, Optional[Usage]]"]],
 ]
 
@@ -119,10 +125,6 @@ def parse_findings(raw: str) -> list[Finding]:
             line = int(item.get("line", 0) or 0)
         except (TypeError, ValueError):
             line = 0
-        try:
-            confidence = int(item.get("confidence", 100) or 100)
-        except (TypeError, ValueError):
-            confidence = 100
         out.append(
             Finding(
                 file=str(file),
@@ -130,48 +132,30 @@ def parse_findings(raw: str) -> list[Finding]:
                 claim=str(claim),
                 severity=str(item.get("severity", "medium")),
                 verdict=str(item.get("verdict", "issue")),
-                confidence=max(0, min(100, confidence)),
                 suggestion=str(item.get("suggestion", "") or ""),
+                evidence=str(item.get("evidence", "") or ""),
+                response=str(item.get("response", "") or ""),
             )
         )
     return out
 
 
 def parse_coordinator_decision(text: str) -> CoordinatorDecision:
-    """Parse the coordinator LLM's JSON judgment into a `CoordinatorDecision`.
+    """Parse the judge's JSON ruling into a `CoordinatorDecision`.
 
-    Tolerant of prose/markdown fences around the JSON object, but raises
-    ValueError if no usable object is found (the caller turns that into a
-    ReviewFailure so a garbled judgment never yields a posted review). Expected
-    shape: {"converged": bool, "agreed": [<finding>...],
-    "disagreed": [{file,line,claim,agent1,agent2}...], "summary": str}.
+    Expected shape: {"converged": bool, "reason": str, "vote": int,
+    "vote_reason": str}. Tolerant of prose/markdown fences around the object,
+    but raises ValueError if no usable object is found or `converged` is missing
+    — the caller turns that into a ReviewFailure, so a garbled ruling never
+    yields a posted review. The judge supplies no findings: the review's content
+    comes from the agents via `convergence`.
     """
     obj = _extract_json_object(text)
     if not isinstance(obj, dict):
-        raise ValueError("coordinator judgment is not a JSON object")
+        raise ValueError("judge ruling is not a JSON object")
+    if "converged" not in obj:
+        raise ValueError("judge ruling has no 'converged' key")
 
-    agreed = parse_findings(json.dumps({"findings": obj.get("agreed") or []}))
-
-    disagreed: list[Disagreement] = []
-    for d in obj.get("disagreed") or []:
-        if not isinstance(d, dict):
-            continue
-        file = str(d.get("file") or "").strip()
-        claim = str(d.get("claim") or "").strip()
-        if not file or not claim:
-            continue
-        try:
-            line = int(d.get("line", 0) or 0)
-        except (TypeError, ValueError):
-            line = 0
-        a1 = str(d.get("agent1") or d.get("agent_1") or "issue")[:60]
-        a2 = str(d.get("agent2") or d.get("agent_2") or "issue")[:60]
-        sev = str(d.get("severity", "medium") or "medium")
-        left = Finding(file=file, line=line, claim=claim, severity=sev, verdict=a1)
-        right = Finding(file=file, line=line, claim=claim, severity=sev, verdict=a2)
-        disagreed.append(Disagreement(file=file, line=line, left=left, right=right))
-
-    converged = bool(obj.get("converged", not disagreed))
     vote = None
     try:
         v = int(obj["vote"])
@@ -179,10 +163,8 @@ def parse_coordinator_decision(text: str) -> CoordinatorDecision:
     except (KeyError, TypeError, ValueError):
         vote = None
     return CoordinatorDecision(
-        converged=converged,
-        agreed=agreed,
-        disagreed=disagreed,
-        summary=str(obj.get("summary") or ""),
+        converged=bool(obj.get("converged")),
+        summary=str(obj.get("reason") or obj.get("summary") or ""),
         vote=vote,
         vote_reason=str(obj.get("vote_reason") or ""),
     )
@@ -334,39 +316,63 @@ def convergence(left: list[Finding], right: list[Finding]) -> ConvergenceResult:
     )
 
 
-def build_cross_exposure_input(
-    *,
-    own: list[Finding],
-    other: list[Finding],
-    open_disagreements: list[Disagreement],
-) -> str:
-    """Deterministically assemble the material for a round 2+ prompt.
+def findings_json(findings: list[Finding]) -> str:
+    """A findings list as the JSON the agents exchange.
 
-    Kept separate from the natural-language framing so the assembly is testable;
-    the string it returns is what the `reasoner` reframes conversationally.
+    Verbatim: claim, evidence and response are passed between the two reviewers
+    exactly as written. Nothing summarizes or paraphrases a rival's argument on
+    its way across — an agent argues with what the other agent actually said.
     """
-    def fmt(fs: list[Finding]) -> list[dict]:
-        return [
-            {"file": f.file, "line": f.line, "severity": f.severity,
-             "verdict": f.verdict, "claim": f.claim}
-            for f in fs
-        ]
-
-    payload = {
-        "your_prior_findings": fmt(own),
-        "other_agents_findings": fmt(other),
-        "still_open": [
+    return json.dumps(
+        [
             {
-                "file": d.file,
-                "line": d.line,
-                "your_verdict": d.left.verdict,
-                "their_verdict": d.right.verdict,
-                "claim": d.left.claim,
+                "file": f.file, "line": f.line, "severity": f.severity,
+                "verdict": f.verdict, "claim": f.claim,
+                "evidence": f.evidence, "suggestion": f.suggestion,
+                "response": f.response,
             }
-            for d in open_disagreements
+            for f in findings
+        ],
+        indent=2,
+        ensure_ascii=False,
+    )
+
+
+def open_items_json(
+    disagreements: list[Disagreement],
+    unanswered: list[Finding],
+    *,
+    own_is_left: bool,
+    own_keys: set[tuple[str, int]],
+) -> str:
+    """The items blocking convergence, written from the recipient's point of view.
+
+    Explicit clashes, plus findings one side raised that the other never
+    responded to (silence is not a verdict). `own_is_left` orients each
+    disagreement — the same `Disagreement` is "you vs them" for one fighter and
+    "them vs you" for the other, and mislabelling it would have an agent argue
+    against its own position.
+    """
+    disputed = []
+    for d in disagreements:
+        mine, theirs = (d.left, d.right) if own_is_left else (d.right, d.left)
+        disputed.append({
+            "file": d.file, "line": d.line, "claim": d.left.claim,
+            "your_verdict": mine.verdict, "your_response": mine.response,
+            "their_verdict": theirs.verdict, "their_response": theirs.response,
+        })
+    payload = {
+        "disputed": disputed,
+        "unanswered": [
+            {
+                "file": f.file, "line": f.line, "claim": f.claim, "raised_as": f.verdict,
+                "whose": "yours (they never responded)" if _key(f) in own_keys
+                         else "theirs (you never responded)",
+            }
+            for f in unanswered
         ],
     }
-    return json.dumps(payload, indent=2, sort_keys=True)
+    return json.dumps(payload, indent=2, ensure_ascii=False)
 
 
 def _dedupe(findings: list[Finding]) -> list[Finding]:
@@ -391,7 +397,12 @@ def _loc(f: Finding) -> str:
 
 
 def _render_grouped(findings: list[Finding]) -> list[str]:
-    """Findings grouped by severity (Critical→Low), each with confidence + fix."""
+    """Findings grouped by severity (Critical→Nit), each with its fix and the
+    code the reviewer checked.
+
+    `Checked` is deliberately public: it lets the author see in one line whether
+    the claim rests on code someone actually read, and call it out when it does
+    not."""
     lines: list[str] = []
     order = sorted(findings, key=lambda f: (_sev_rank(f.severity), _key(f)))
     current: str | None = None
@@ -401,9 +412,11 @@ def _render_grouped(findings: list[Finding]) -> list[str]:
             current = sev
             lines.append("")
             lines.append(f"### {sev.capitalize()}")
-        lines.append(f"- **{_loc(f)}** _(confidence {f.confidence})_ — {f.claim}")
+        lines.append(f"- **{_loc(f)}** — {f.claim}")
         if f.suggestion:
             lines.append(f"  - **Fix:** {f.suggestion}")
+        if f.evidence:
+            lines.append(f"  - **Checked:** {f.evidence}")
     return lines
 
 
@@ -415,9 +428,11 @@ def synthesize_final_review(
     reviewed: str | None = None,
 ) -> str:
     """Inclusive union write-up in the pr-review format: a "reviewed" header,
-    findings grouped by severity with confidence + a concrete fix, agreed items
-    first, then disagreements surfaced explicitly, then one-reviewer concerns.
-    No tiebreak."""
+    findings grouped by severity with a concrete fix, agreed items first, then
+    disagreements with BOTH sides quoted, then one-reviewer concerns.
+
+    No tiebreak, and nothing is dropped: where the reviewers never agreed, the
+    author gets each side's actual argument and decides for themselves."""
     lines: list[str] = ["# Code Review"]
     if reviewed:
         lines.append(f"_Reviewed {reviewed}._")
@@ -432,11 +447,13 @@ def synthesize_final_review(
         lines.append("")
         lines.append("## Unresolved disagreements")
         lines.append("")
+        lines.append("_The two reviewers could not settle these. Both arguments verbatim:_")
         for d in sorted(disagreements, key=lambda x: (x.file, x.line)):
-            lines.append(
-                f"- **{_loc(d.left)}** — {d.left.claim} "
-                f"(agent 1: `{d.left.verdict}`, agent 2: `{d.right.verdict}`)"
-            )
+            lines.append("")
+            lines.append(f"- **{_loc(d.left)}** — {d.left.claim}")
+            for label, side in (("Reviewer 1", d.left), ("Reviewer 2", d.right)):
+                argument = side.response or side.claim
+                lines.append(f"  - **{label}** (`{side.verdict}`): {argument}")
 
     if unmatched:
         lines.append("")
@@ -459,26 +476,196 @@ def _independent_path(harness: HarnessType) -> str:
     return f"{FINDINGS_DIR}/findings-{harness.value}-independent.json"
 
 
-def _independent_prompt(diff: str, findings_path: str) -> str:
-    return (
-        "You are reviewing a pull request. Review the diff below independently "
-        "and thoroughly. If you have the agent-fight-review skill, follow it.\n\n"
-        f"Write your findings as JSON to {findings_path} — a list of objects, each "
-        '{"file","line","claim","severity","confidence","suggestion","verdict":"issue"}. '
-        "severity is one of critical|major|minor|nit; confidence is 0-100 (only "
-        "report issues you are >=80 confident are real); suggestion is a concrete "
-        "fix. Review across the nine dimensions (correctness, readability, "
-        "simplicity, consistency, maintainability, test coverage, error handling, "
-        "performance, security). Prefer few high-signal findings over nitpicks.\n\n"
-        f"Full repo is at {WORKDIR}; read any file you need for context.\n\n"
-        "--- DIFF ---\n"
-        f"{diff}\n"
+def _pr_header(job: ReviewJob) -> str:
+    """The identifying block both prompts open with."""
+    lines = [
+        f"  {job.organization}/{job.project}  repo {job.repo_name}  PR !{job.pr_id}",
+        f"  {job.source_branch} -> {job.target_branch}",
+    ]
+    if job.pr_web_url:
+        lines.append(f"  {job.pr_web_url}")
+    return "\n".join(lines)
+
+
+_MATERIAL = f"""\
+WHAT YOU HAVE
+  {WORKDIR}
+      The full repository, PR branch checked out. Read anything in it.
+  {DIFF_PATH}
+      The exact diff under review.
+  {PR_CONTEXT_PATH}
+      The pull request itself: title, description, linked work items, and EVERY
+      comment thread on it -- including any previous agent-fight review and the
+      author's replies to it. Read it. If the author has already answered a
+      point, their reply is evidence.
+  the live PR API
+      curl -s -H "Authorization: $ADO_AUTH_HEADER" \\
+           "$ADO_PR_API/threads?api-version=$ADO_API_VERSION"
+      Also /iterations, /workitems, /commits. Pull whatever you need."""
+
+_STANDARDS = """\
+SCOPE
+  The diff is the review. Read as widely as you need to understand it, but only
+  report what THIS change breaks, introduces, or newly exposes. If the problem
+  is in code this PR did not touch, raise it only if the change makes it
+  reachable or wrong -- and say which changed line does that.
+
+BEFORE YOU CLAIM A DEFECT
+  Follow the call path and read the code at every hop before you assert a
+  consequence. "This creates a duplicate record", "this loads the wrong row",
+  "this posts without the id" are claims about what the system actually does:
+  open the caller, the controller, the handler, the service, and check. If you
+  have not read the code that produces the consequence you are describing, you
+  do not have a finding.
+  The absence of a pattern you expected -- a missing input binding, parameter,
+  guard, null check -- is a QUESTION, not a defect, until you have found the
+  code that needs it. Two components differing is not a bug; it is a bug only
+  when you can show the behavior it breaks.
+  Put what you actually read in "evidence". A finding with no evidence is
+  noise, and the rival reviewer will take it apart.
+
+REVIEW ACROSS
+  Correctness, Readability, Simplicity, Consistency, Maintainability, Test
+  Coverage, Error Handling, Performance, Security. Real defects and clear
+  convention violations -- not style preferences.
+
+EVERY ENTRY IN THE FILE ASSERTS A DEFECT
+  The findings file is a defect list, and every entry in it is published to the
+  pull request as something the author must consider. It is NOT a report, a
+  summary, or a place to show your work. Never file:
+    - praise or approval ("the fix is correct and well-scoped")
+    - a summary of what the change does, or of what you verified
+    - an item whose suggestion is "no change required" / "none" / "looks good"
+  If the change is clean, the answer is an empty list. That is a real verdict
+  and it is the right one more often than not. An approving note filed as a
+  finding publishes a "concern" that isn't one, and makes the whole review
+  worthless."""
+
+
+def build_independent_prompt(job: ReviewJob, diff: str, findings_path: str, *, round_cap: int) -> str:
+    """Round 0: review the pull request blind, before seeing the rival."""
+    if len(diff) > MAX_INLINE_DIFF:
+        diff = (
+            diff[:MAX_INLINE_DIFF]
+            + f"\n\n... diff truncated here. Read the whole thing at {DIFF_PATH}.\n"
+        )
+    return f"""\
+You are one of two independent code reviewers in an "agent fight". You and a
+rival reviewer -- a different AI harness -- review this pull request separately,
+then argue it out over up to {round_cap} rounds until you agree. This is round 0:
+your independent review. The rival cannot see you yet.
+
+PULL REQUEST
+{_pr_header(job)}
+
+{_MATERIAL}
+
+{_STANDARDS}
+
+OUTPUT -- write JSON to {findings_path}
+[
+  {{
+    "file": "path/relative/to/repo/root.cs",
+    "line": 191,
+    "severity": "critical|major|minor|nit",
+    "claim": "What is wrong and the concrete consequence.",
+    "evidence": "The files and lines you read that prove that consequence.",
+    "suggestion": "The specific fix.",
+    "verdict": "issue"
+  }}
+]
+An empty list [] is a valid and meaningful answer: the change is clean.
+`line` is 1-indexed; 0 means file-level. Write the file -- console output is
+ignored.
+
+--- DIFF ---
+{diff}
+"""
+
+
+def build_fight_prompt(
+    job: ReviewJob,
+    *,
+    own: list[Finding],
+    other: list[Finding],
+    disagreements: list[Disagreement],
+    unanswered: list[Finding],
+    round_no: int,
+    round_cap: int,
+    findings_path: str,
+    own_is_left: bool = True,
+) -> str:
+    """Round 1+: the fight. Both reviews, the open items, and the code.
+
+    `own_is_left` says which side of a `Disagreement` belongs to the recipient
+    (`convergence` always puts the first harness on the left)."""
+    open_items = open_items_json(
+        disagreements, unanswered,
+        own_is_left=own_is_left, own_keys={_key(f) for f in own},
     )
+    return f"""\
+This is round {round_no} of {round_cap} of an agent fight over this pull request. You and
+a rival reviewer reviewed it independently. Below is your review and theirs.
 
+Your job this round: go back to the code and settle it.
 
-async def _default_framing(structured: str) -> str:
-    """Fallback reasoner: pass the structured material through unframed."""
-    return structured
+  1. Re-read the code for every item -- yours AND theirs. You have the full repo,
+     the diff, and the pull request; use them.
+  2. For each of THEIR findings: agree or disagree, and mark it. If you disagree,
+     prove it -- name the file and line that shows they are wrong. If you agree,
+     say so plainly.
+  3. For each of YOUR findings they challenged: re-read the code, then hold the
+     line with evidence, revise it, or withdraw it. Withdrawing a finding you
+     cannot support is a win. Conceding one you can support is a loss.
+  4. Verify before you rule. Do not agree with a finding you have not checked in
+     the code, and do not disagree without evidence. "Sounds plausible" is not a
+     verdict.
+  5. You may add a NEW finding if re-reading turned one up -- same evidence bar.
+
+PULL REQUEST
+{_pr_header(job)}
+
+{_MATERIAL}
+
+YOUR REVIEW SO FAR
+{findings_json(own)}
+
+THE RIVAL REVIEWER'S REVIEW
+{findings_json(other)}
+
+STILL OPEN AFTER THE LAST ROUND
+{open_items}
+
+OUTPUT -- write JSON to {findings_path}
+The complete list for this round: every item still in play, yours and theirs.
+[
+  {{
+    "file": "...", "line": 191, "severity": "critical|major|minor|nit",
+    "claim": "...", "evidence": "...", "suggestion": "...",
+    "verdict": "issue|agree|disagree|revised|resolved",
+    "response": "Your argument this round: why you agree, or why they are wrong."
+  }}
+]
+  issue     your own finding, unchallenged and unchanged
+  agree     you accept this finding -- yours or theirs -- as real
+  disagree  you reject it; put the refuting code in "response"
+  revised   real, but the claim or severity was wrong; state the corrected claim
+  resolved  you are withdrawing it; say why in "response"
+
+WITHDRAWING IS `resolved` -- NOTHING ELSE
+  If you are dropping an item, the verdict MUST be "resolved". Do not withdraw
+  it by rewriting `claim` into an explanation of why the code is fine and
+  leaving any other verdict: everything except "resolved" is read as you still
+  asserting a defect, and it gets published to the pull request as a concern.
+  `claim` always states the defect, even on the item you are giving up; your
+  reason for dropping it goes in `response`.
+
+Keep the rival's EXACT file and line when you respond to their item -- that
+anchor is how the two reviews are matched, and drifting off it reads as two
+separate findings rather than one you settled. Respond to every one of their
+items, INCLUDING the ones you simply agree with; silence is not a verdict and
+will cost another round. Write the file -- console output is ignored.
+"""
 
 
 async def run_review(
@@ -488,22 +675,21 @@ async def run_review(
     runner: ContainerRunner,
     ado_client,
     harnesses: Optional[list[HarnessType]] = None,
-    reasoner: Optional[Reasoner] = None,
     judge: Optional[Judge] = None,
     post_back: bool = True,
 ) -> ReviewOutcome:
     """Run the full review for one PR and return a `ReviewOutcome`.
 
     Structure: an unnumbered independent-review prep phase (both agents review
-    the diff blind), then up to `settings.round_cap` battle rounds in which each
-    agent sees the other's latest findings and the coordinator `judge` decides —
-    semantically — what they agree on, what remains disputed, and whether to
-    continue. The final review is authored from the last judgment.
+    the pull request blind), then up to `settings.round_cap` fight rounds in
+    which each agent re-reviews the code with the rival's findings in hand and
+    marks every item agree / disagree / revised / resolved. After each round the
+    `judge` rules on whether the fight is settled. The review's content is the
+    agents' own findings, diffed by `convergence` — the judge never writes it.
 
-    `runner` provides the container; `reasoner` reframes cross-exposure prompts
-    conversationally (defaults to passthrough); `judge` is the coordinator LLM
-    (defaults to the deterministic `_fallback_judge`); `ado_client` posts the
-    result unless `post_back` is False.
+    `runner` provides the container; `judge` is the coordinator LLM (defaults to
+    the deterministic `_fallback_judge`); `ado_client` posts the result unless
+    `post_back` is False.
 
     The returned `ReviewOutcome` carries the posted markdown plus the metrics the
     runner persists. Failures raise `ReviewFailure` (recorded as `failed`) — they
@@ -512,12 +698,12 @@ async def run_review(
     harnesses = harnesses or [HarnessType.CLAUDE, HarnessType.CODEX]
     if len(harnesses) != 2:
         raise ValueError("the review expects exactly two harnesses")
-    reasoner = reasoner or _default_framing
     judge = judge or _fallback_judge
     round_cap = max(1, int(settings.round_cap))
     h1, h2 = harnesses
 
     usage_records: list[RoleRoundUsage] = []
+    raw_records: list[RawFindings] = []
     rounds_used = 0
 
     logger.info(
@@ -529,18 +715,23 @@ async def run_review(
     async def _run_harness(h: HarnessType, prompt: str, fpath: str, round_no: int, phase: str):
         """Run one harness, capture usage, and fail-closed on any fault."""
         argv = build_argv(h, workdir=WORKDIR, model=harness_model(h, settings))
+        env = {**harness_env(h, settings), **ado_env(job, settings)}
         exec_res = await handle.exec(
-            argv, env=harness_env(h, settings), stdin=prompt, timeout=HARNESS_TIMEOUT
+            argv, env=env, stdin=prompt, timeout=HARNESS_TIMEOUT
         )
         # Capture usage even on failure so a failed run still accounts for spend.
         h_usage = extract_usage(h, exec_res.stdout)
         if not h_usage.is_empty:
             usage_records.append(RoleRoundUsage(h.value, round_no, h_usage))
+        raw = await _read_or_none(handle, fpath)
+        if raw is not None:
+            # Keep the bytes, not just the parse: a finding that reads wrong on
+            # the PR is diagnosed from what the harness actually wrote.
+            raw_records.append(RawFindings(h.value, round_no, raw))
         # A broken harness must NEVER be synthesized into a clean/consensus review
         # — this raises BEFORE post-back, so nothing reaches the PR.
         return _read_findings_or_fail(
-            h, round_no, exec_res, await _read_or_none(handle, fpath),
-            usage_records, phase=phase,
+            h, round_no, exec_res, raw, usage_records, phase=phase,
         )
 
     async with runner.start(job) as handle:
@@ -556,79 +747,91 @@ async def run_review(
             # Not a failure (the branch may genuinely add nothing), but log it —
             # an empty diff is also the fingerprint of a bad ref/checkout.
             logger.warning("PR %s: computed diff is EMPTY — reviewers will see no changes", job.pr_id)
+        # The pull request itself — description, work items, and every comment
+        # thread, including the author's replies to our last review. Reviewers
+        # must never re-raise a finding the author already refuted.
+        if ado_client is not None:
+            await write_pr_context(handle, await ado_client.fetch_pr_context(settings, job))
+        else:
+            logger.warning("PR %s: no ADO client — reviewing without PR context", job.pr_id)
 
         prev: dict[HarnessType, list[Finding]] = {}
 
         # ---- Independent review (prep phase — NOT a round) ------------------ #
-        # Both agents review the diff blind. This builds the prerequisites for a
-        # debate; it is not a battle round and no coordinator judgment runs yet.
+        # Both agents review blind. This builds the prerequisites for a fight; it
+        # is not a fight round and no judgment runs yet.
         logger.info("PR %s: independent review (both agents, blind)", job.pr_id)
         for h in harnesses:
             fpath = _independent_path(h)
             prev[h] = await _run_harness(
-                h, _independent_prompt(diff, fpath), fpath, round_no=0,
-                phase="independent review",
+                h,
+                build_independent_prompt(job, diff, fpath, round_cap=round_cap),
+                fpath, round_no=0, phase="independent review",
             )
 
-        # ---- Battle rounds -------------------------------------------------- #
+        # ---- Fight rounds --------------------------------------------------- #
         decision: Optional[CoordinatorDecision] = None
+        result = convergence(prev[h1], prev[h2])
         for round_no in range(1, round_cap + 1):
             rounds_used = round_no
-            open_disagreements = list(decision.disagreed) if decision else []
+            # Snapshot before either agent runs, so both fight the same opponent
+            # state. Reading `prev` live would hand the second agent the first
+            # agent's brand-new findings while the first saw only last round's —
+            # a first-mover advantage that quietly shapes who concedes.
+            opening = dict(prev)
+            open_disagreements = list(result.disagreements)
+            unanswered = list(result.unmatched)
 
             for h in harnesses:
                 other = h2 if h is h1 else h1
                 fpath = _findings_path(h, round_no)
-                structured = build_cross_exposure_input(
-                    own=prev.get(h, []),
-                    other=prev.get(other, []),
-                    open_disagreements=open_disagreements,
-                )
-                framed, coord_usage = _unpack_framing(await reasoner(structured))
-                if coord_usage is not None and not coord_usage.is_empty:
-                    usage_records.append(RoleRoundUsage("coordinator", round_no, coord_usage))
-                prompt = (
-                    "This is a round of a code-review debate. Below are your own "
-                    "prior findings, the other reviewer's findings, and the items "
-                    "still open. Defend, concede, or revise each — respond by "
-                    "writing an updated findings entry marking it "
-                    '"agree", "disagree" (with reasoning in claim), "revised", or '
-                    '"resolved".\n\n'
-                    f"Write the result as JSON to {fpath}.\n\n"
-                    f"{framed}\n"
+                prompt = build_fight_prompt(
+                    job,
+                    own=opening.get(h, []),
+                    other=opening.get(other, []),
+                    disagreements=open_disagreements,
+                    unanswered=unanswered,
+                    round_no=round_no,
+                    round_cap=round_cap,
+                    findings_path=fpath,
+                    own_is_left=h is h1,
                 )
                 prev[h] = await _run_harness(
                     h, prompt, fpath, round_no=round_no, phase=f"round {round_no}"
                 )
 
-            # The coordinator LLM judges agreement and decides whether to continue.
+            # The agents' own marks decide what the review says; the judge only
+            # decides whether the fight is over (and what to vote).
+            result = convergence(prev[h1], prev[h2])
             decision, judge_usage = _unpack_judgment(
-                await judge(prev[h1], prev[h2], round_no)
+                await judge(prev[h1], prev[h2], round_no, round_cap)
             )
             if judge_usage is not None and not judge_usage.is_empty:
                 usage_records.append(RoleRoundUsage("coordinator", round_no, judge_usage))
 
             logger.info(
-                "PR %s round %s of %s: agreed=%s disagreed=%s converged=%s",
+                "PR %s round %s of %s: agreed=%s disputed=%s unanswered=%s converged=%s (%s)",
                 job.pr_id, round_no, round_cap,
-                len(decision.agreed), len(decision.disagreed), decision.converged,
+                len(result.converged), len(result.disagreements), len(result.unmatched),
+                decision.converged, decision.summary or "no reason given",
             )
             if decision.converged:
                 logger.info("PR %s converged after round %s", job.pr_id, round_no)
                 break
 
-        agreed = list(decision.agreed) if decision else []
-        disagreed = list(decision.disagreed) if decision else []
+        agreed = list(result.converged)
+        disagreed = list(result.disagreements)
+        unmatched = list(result.unmatched)
 
         # Reviewer vote: the coordinator's recommendation, else derived from the
         # findings. Included in the comment and cast on the PR below.
         if decision is not None and decision.vote in _ALLOWED_VOTES and decision.vote != 0:
             vote, vote_reason = decision.vote, (decision.vote_reason or vote_label(decision.vote))
         else:
-            vote, vote_reason = _derive_vote(agreed, disagreed)
+            vote, vote_reason = _derive_vote(agreed + unmatched, disagreed)
 
         review_md = synthesize_final_review(
-            agreed, disagreed, [],
+            agreed, disagreed, unmatched,
             reviewed=f"`{job.source_branch}` → `{job.target_branch}`",
         )
         review_md += f"\n\n---\n**Reviewer vote:** {vote_label(vote)} — {vote_reason}\n"
@@ -658,8 +861,9 @@ async def run_review(
         rounds_used=rounds_used,
         converged_count=len(agreed),
         disagreement_count=len(disagreed),
-        unmatched_count=0,
+        unmatched_count=len(unmatched),
         usage=usage_records,
+        raw_findings=raw_records,
         vote=vote,
         vote_reason=vote_reason,
     )
@@ -728,19 +932,6 @@ def _read_findings_or_fail(
     return parse_findings(raw)
 
 
-def _unpack_framing(
-    framed: Union[str, "tuple[str, Optional[Usage]]"]
-) -> tuple[str, Optional[Usage]]:
-    """Normalize a reasoner's return into (prose, usage-or-None).
-
-    A passthrough/test reasoner returns a bare string; the production proxy
-    reasoner returns (prose, Usage) so coordinator tokens are counted."""
-    if isinstance(framed, tuple):
-        text, usage = framed
-        return text, usage
-    return framed, None
-
-
 def _unpack_judgment(
     res: Union[CoordinatorDecision, "tuple[CoordinatorDecision, Optional[Usage]]"]
 ) -> tuple[CoordinatorDecision, Optional[Usage]]:
@@ -752,18 +943,12 @@ def _unpack_judgment(
 
 
 async def _fallback_judge(
-    left: list[Finding], right: list[Finding], round_no: int
+    left: list[Finding], right: list[Finding], round_no: int, round_cap: int
 ) -> CoordinatorDecision:
     """Deterministic judge used when no coordinator LLM is configured (degraded).
 
-    Maps the string-diff `convergence()` into a `CoordinatorDecision`: agreed +
-    one-sided concerns become `agreed` (surfaced), clashes become `disagreed`,
-    and `converged` mirrors `fully_converged`. This is a fallback only — the
-    production path is the LLM judge (see runner._proxy_judge)."""
+    Rules on the same question the LLM judge is asked, structurally: the fight is
+    over when nothing is disputed and nothing was left unanswered. Supplies no
+    vote, so the loop derives one from the findings."""
     r = convergence(left, right)
-    return CoordinatorDecision(
-        converged=r.fully_converged,
-        agreed=list(r.converged) + list(r.unmatched),
-        disagreed=list(r.disagreements),
-        summary="",
-    )
+    return CoordinatorDecision(converged=r.fully_converged, summary="")

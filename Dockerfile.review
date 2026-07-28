@@ -12,8 +12,12 @@
 # Build:  docker build -f Dockerfile.review -t agent-fight-review:latest .
 FROM node:20-bookworm-slim
 
+# curl + jq are for the reviewers, not the app: each harness is handed the PR's
+# REST endpoint and a PAT header (app/harness.py::ado_env) so it can pull the
+# description, work items, and comment threads itself.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git ca-certificates bubblewrap \
+    && apt-get install -y --no-install-recommends \
+        git ca-certificates bubblewrap curl jq \
     && rm -rf /var/lib/apt/lists/*
 
 # Both harness CLIs, installed globally (as root, before dropping privileges).

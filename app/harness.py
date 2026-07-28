@@ -250,6 +250,32 @@ def harness_env(harness: HarnessType, settings: Settings) -> dict[str, str]:
     raise ValueError(f"unknown harness: {harness!r}")
 
 
+def ado_env(job, settings: Settings) -> dict[str, str]:
+    """Azure DevOps env for a review harness, so it can read the PR itself.
+
+    The reviewers are full agents; rather than pre-digesting the pull request for
+    them, hand them the endpoint and let them pull whatever they need
+    (`/threads`, `/iterations`, `/workitems`, ...):
+
+        curl -s -H "Authorization: $ADO_AUTH_HEADER" "$ADO_PR_API/threads?api-version=7.1"
+
+    This exposes no new secret: `prepare_repo` embeds the same credential in the
+    clone URL, so the PAT is already sitting in `.git/config` inside the
+    container. Empty dict when the PAT is unset — the harness then works from
+    the diff, the repo, and the PR context file alone.
+    """
+    from app.ado import ADO_API_VERSION, basic_auth_header, pr_api_base
+
+    if not settings.ado_pat:
+        return {}
+    return {
+        "ADO_AUTH_HEADER": basic_auth_header(settings.ado_pat),
+        "ADO_PR_API": pr_api_base(job),
+        "ADO_API_VERSION": ADO_API_VERSION,
+        "ADO_PR_WEB_URL": job.pr_web_url or "",
+    }
+
+
 def codex_auth_json(api_key: str) -> str:
     """~/.codex/auth.json — Codex prefers this over the env var on every call."""
     return json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": api_key})

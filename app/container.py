@@ -31,6 +31,10 @@ logger = logging.getLogger("agent_fight.container")
 
 WORKDIR = "/work/repo"
 FINDINGS_DIR = "/work/findings"
+# The review surface and the pull request itself, materialized as files the
+# harnesses can read directly (they are also told how to hit the live PR API).
+DIFF_PATH = "/work/pr.diff"
+PR_CONTEXT_PATH = "/work/pr-context.md"
 # HOME in the review image (Dockerfile.review), where Codex reads its config.
 # The image runs as the non-root `node` user (Claude refuses
 # --dangerously-skip-permissions as root).
@@ -283,13 +287,25 @@ async def provision_harnesses(handle: ContainerHandle, settings) -> None:
 
 
 async def compute_diff(handle: ContainerHandle, job: ReviewJob) -> str:
-    """The target..source diff the harnesses review."""
+    """The target..source diff the harnesses review.
+
+    Also written to `DIFF_PATH` in the container: the prompt inlines only a
+    bounded excerpt, so the file is what a harness re-reads on a large PR or in
+    a later fight round.
+    """
     res = await handle.exec(
         ["git", "-C", WORKDIR, "diff", f"origin/{job.target_branch}...{job.source_branch}"],
     )
     if not res.ok:
         raise RuntimeError(f"git diff failed: {res.stderr.strip()}")
+    await handle.write_file(DIFF_PATH, res.stdout)
     return res.stdout
+
+
+async def write_pr_context(handle: ContainerHandle, markdown: str) -> None:
+    """Drop the rendered pull request (description, work items, every comment
+    thread and reply) into the container at `PR_CONTEXT_PATH`."""
+    await handle.write_file(PR_CONTEXT_PATH, markdown)
 
 
 # --------------------------------------------------------------------------- #
@@ -305,12 +321,14 @@ class FakeHandle:
     files: dict[str, str] = field(default_factory=dict)
     exec_log: list[list[str]] = field(default_factory=list)
     stdin_log: list[Optional[str]] = field(default_factory=list)
+    env_log: list[dict[str, str]] = field(default_factory=list)
     exec_results: dict[str, ExecResult] = field(default_factory=dict)
     stopped: bool = False
 
     async def exec(self, argv, *, env=None, cwd=None, stdin=None, timeout=None) -> ExecResult:
         self.exec_log.append(list(argv))
         self.stdin_log.append(stdin)
+        self.env_log.append(dict(env or {}))
         key = " ".join(argv)
         for pattern, result in self.exec_results.items():
             if pattern in key:

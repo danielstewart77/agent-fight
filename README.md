@@ -28,22 +28,51 @@ the ADO PR service-hook payload into a `ReviewJob`, and dispatches the review
 run in the background (returning `202` immediately). The pipeline itself is
 built:
 
-- `app/ado.py` — parse the PR webhook payload; post the final review back as a
-  PR thread comment.
+- `app/ado.py` — parse the PR webhook payload; `fetch_pr_context` (description,
+  work items, and every comment thread + reply, rendered for the reviewers);
+  post/update the review thread and cast the reviewer vote.
 - `app/proxy.py` — coordinator's inference-proxy client (`ping`,
   Anthropic-Messages `complete`), `list_models` for the admin dropdown, and
   base-URL root normalization; a non-fatal startup health-ping and a
   `GET /health/proxy` diagnostic.
 - `app/harness.py` — per-harness `build_argv` / `parse_line` (normalizing
-  stream-json into one event vocabulary) / `harness_env` + the Codex
+  stream-json into one event vocabulary) / `harness_env` / `ado_env` (the PR
+  REST endpoint + PAT header the reviewers curl) + the Codex
   `auth.json`/`config.toml` builders.
 - `app/container.py` — the per-review `docker run` lifecycle behind a
   `ContainerRunner` interface (`DockerRunner` real, `FakeRunner` for tests);
-  single clone + fetch target/PR refs + checkout PR branch.
-- `app/coordinator.py` — the round-loop consensus: independent round 1,
-  conversational cross-exposure in round 2+, convergence diff by
-  `(file, line, verdict)`, inclusive synthesis at the round cap with
-  disagreements surfaced rather than tiebroken.
+  single clone + fetch target/PR refs + checkout PR branch, and the
+  `/work/pr.diff` + `/work/pr-context.md` the harnesses read.
+- `app/coordinator.py` — the fight loop (below).
+
+### The fight
+
+Round 0 is a blind independent review: each harness gets the repo checked out at
+the PR branch, `/work/pr.diff`, `/work/pr-context.md`, and a live PR API
+endpoint, and writes structured findings.
+
+Rounds 1..N are the fight. Each harness runs again **in the same container, with
+the same checkout**, and is handed its own findings plus the rival's *verbatim*
+and every item still open. Nothing summarizes a rival's argument on the way
+across. The instruction is to go back to the code and settle it — agree,
+disagree with the code that refutes it, revise, or withdraw — marking every item
+`agree` / `disagree` / `revised` / `resolved`. Both fighters see the same
+opponent state (snapshotted at the top of the round), so neither gets a
+first-mover advantage.
+
+After each round a judge rules on one question: is the fight over? It sees both
+findings files and **no code**; it never writes, merges, or rewords a finding.
+Converged means nothing is left where one reviewer asserts a defect and the
+other rejects or ignores it. It also casts the reviewer vote. The review's
+content is the agents' own text, diffed by `convergence` into agreed / disputed
+/ one-sided, with both sides of a dispute quoted in full.
+
+Findings carry `evidence` (the code the reviewer actually read) rather than a
+self-scored confidence. A claim about runtime behavior that crosses layers needs
+the code at every hop; the rival's job is to attack anything that doesn't have
+it. On a re-review, the author's replies to the previous review arrive in
+`/work/pr-context.md` — a finding the author already refuted must not come back
+without code that answers them.
 
 **Not exercised in this environment.** The Docker driver, the real harness
 CLIs, the live proxy, and real ADO payloads/REST calls cannot run here, so the

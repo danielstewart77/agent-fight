@@ -99,7 +99,6 @@ async def _default_run(job: ReviewJob) -> None:
 
         from app import skills as skills_mod
 
-        reasoner = _proxy_reasoner(settings)
         judge = _proxy_judge(settings)
         if judge is None:
             logger.warning(
@@ -115,7 +114,6 @@ async def _default_run(job: ReviewJob) -> None:
                 settings,
                 runner=DockerRunner(config.review_image, mounts=mounts),
                 ado_client=ado_client,
-                reasoner=reasoner,
                 judge=judge,
             )
         finally:
@@ -129,7 +127,6 @@ async def run_and_record(
     *,
     runner,
     ado_client,
-    reasoner=None,
     judge=None,
 ):
     """Run one review to completion and persist it as a `Review` row.
@@ -141,11 +138,11 @@ async def run_and_record(
     (the dispatcher's guard still logs it). This is what makes a failed run
     visible without shelling into the process log.
 
-    `runner`/`ado_client`/`reasoner` are injected so the whole lifecycle is
+    `runner`/`ado_client`/`judge` are injected so the whole lifecycle is
     exercisable against `FakeRunner` without Docker or a live proxy.
     """
     from app.coordinator import run_review
-    from app.orm import Review, ReviewTokenUsage
+    from app.orm import Review, ReviewFinding, ReviewTokenUsage
 
     review = Review(
         pr_id=job.pr_id,
@@ -182,8 +179,7 @@ async def run_and_record(
     started = time.monotonic()
     try:
         outcome = await run_review(
-            job, settings, runner=runner, ado_client=ado_client,
-            reasoner=reasoner, judge=judge,
+            job, settings, runner=runner, ado_client=ado_client, judge=judge,
         )
     except Exception as exc:  # noqa: BLE001 - record failure, DO NOT post, re-raise to log
         # A failed run is recorded as `failed` and NOTHING is posted to the PR
@@ -210,6 +206,14 @@ async def run_and_record(
     review.finished_at = _utcnow()
     review.duration_ms = int((time.monotonic() - started) * 1000)
     _persist_usage(outcome.usage)
+    # Keep every agent's raw output beside the comment it produced, so a review
+    # that reads wrong can be explained from the source rather than guessed at.
+    for rf in outcome.raw_findings:
+        session.add(
+            ReviewFinding(
+                review_id=review.id, role=rf.role, round_no=rf.round_no, raw=rf.raw
+            )
+        )
     await session.commit()
     logger.info(
         "PR %s review #%s complete: status=%s rounds=%s findings=%s",
@@ -218,76 +222,58 @@ async def run_and_record(
     return review
 
 
-def _proxy_reasoner(settings) -> Optional[Callable[[str], Awaitable[str]]]:
-    """A reasoner that reframes cross-exposure material via the coordinator
-    proxy, or None (coordinator falls back to passthrough) when it's
-    unconfigured."""
-    if not settings.coord_proxy_url or not settings.coord_proxy_key:
-        return None
+_JUDGE_SYSTEM = """\
+You are the coordinator of an agent fight: two independent code reviewers argue
+over one pull request until they agree or the round cap is reached. You have just
+been handed both reviewers' latest reviews.
 
-    from app.proxy import ProxyClient
+You do NOT review the code, and you do NOT rewrite, merge, or improve anyone's
+findings. Their words go to the pull request as written. Your only decision is
+whether the fight is over.
 
-    async def reason(structured: str):
-        """Returns (prose, Usage) so the coordinator's token spend is recorded."""
-        async with ProxyClient(
-            settings.coord_proxy_url,
-            settings.coord_proxy_key,
-            model=settings.coord_model,
-            flavor=settings.coord_flavor or "anthropic",
-        ) as pc:
-            return await pc.complete_with_usage(
-                system=(
-                    "You are the coordinator in a multi-agent code review. Reframe "
-                    "the structured findings below into a concise, conversational "
-                    "briefing for one reviewer — summarize their own prior points, "
-                    "then present the other reviewer's points and the open "
-                    "disagreements fairly, inviting them to agree, disagree, or revise."
-                ),
-                messages=[{"role": "user", "content": structured}],
-            )
+CONVERGED = nothing is left for the two of them to argue about. Work through
+every item in both reviews and settle it:
 
-    return reason
+  both assert it (issue / agree / revised)      -> SETTLED
+  one asserts it, the other withdrew (resolved) -> SETTLED
+  one asserts it, the other marked "disagree"   -> NOT SETTLED, they are still
+                                                   fighting over it
+  one asserts it, and the other filed findings
+    this round but never addressed this item    -> NOT SETTLED. They engaged
+                                                   with the review and ducked
+                                                   this one; make them answer.
+  one asserts it, and the other filed NO
+    findings at all this round                  -> SETTLED. They reviewed and
+                                                   had nothing; there is no
+                                                   dispute to resolve, and
+                                                   another round buys nothing.
+  neither asserts anything                      -> SETTLED
 
+Judge the substance, not the anchor. The two reviewers may describe the same
+issue at different lines or in different words — that is ONE item, and if they
+agree on it, it is settled. Do not call a fight unsettled over wording.
 
-_JUDGE_SYSTEM = (
-    "You are the coordinator of a two-agent code-review debate. You are given "
-    "both reviewers' latest findings on the same pull-request diff. Decide, "
-    "semantically, which findings they AGREE are real issues, which remain a "
-    "genuine open dispute, and whether the debate has converged.\n\n"
-    "Rules:\n"
-    "- Match findings that describe the SAME underlying issue even if worded "
-    "differently or off by a line — treat those as one item.\n"
-    "- A finding one side raised and the other did not contradict, or that one "
-    "side withdrew/resolved, is NOT a dispute.\n"
-    "- Only a substantive disagreement about whether something is a real issue "
-    "counts as disputed. If there are no such disputes, converged is true.\n"
-    "- For agreed items, author the finding cleanly (keep the strongest claim "
-    "and a concrete fix).\n\n"
-    "Also cast a reviewer VOTE on the pull request based on the findings, using "
-    "this policy:\n"
-    "- 10  (approve): no issues.\n"
-    "- 5   (approve with suggestions): only minor/nit issues, nothing unresolved.\n"
-    "- -5  (wait for author): any major/critical agreed issue, OR any unresolved "
-    "disagreement.\n"
-    "- -10 (reject): reserve for egregious, clearly-unmergeable changes; prefer "
-    "-5 when unsure.\n\n"
-    "Respond with ONLY a JSON object, no prose, no code fences:\n"
-    '{"converged": <bool>, '
-    '"agreed": [{"file","line","severity","claim","confidence","suggestion"}], '
-    '"disagreed": [{"file","line","claim","agent1","agent2"}], '
-    '"vote": <10|5|-5|-10>, "vote_reason": "<one line>", '
-    '"summary": "<one line>"}\n'
-    "severity is critical|major|minor|nit. agent1/agent2 are each reviewer's "
-    "short stance on the disputed item."
-)
+Also cast the reviewer's vote on the pull request:
+  10   approve                   no findings survive
+   5   approve with suggestions  only minor/nit findings survive
+  -5   wait for author           any surviving critical or major finding, or the
+                                 round cap was reached with the fight unsettled
+ -10   reject                    egregious and clearly unmergeable; prefer -5
+
+Respond with ONLY this JSON object. No prose, no code fences:
+{"converged": <bool>,
+ "reason": "<one line: what is still contested, or that nothing is>",
+ "vote": <10|5|-5|-10>,
+ "vote_reason": "<one line>"}
+"""
 
 
 def _proxy_judge(settings):
     """The coordinator LLM judge, or None when the coord proxy is unconfigured
     (run_review then uses the deterministic fallback). Returns a callable
-    judge(left, right, round_no) -> (CoordinatorDecision, Usage) that fails
-    closed: any proxy error or unparseable judgment raises ReviewFailure, so a
-    garbled judgment can never produce a posted review."""
+    judge(left, right, round_no, round_cap) -> (CoordinatorDecision, Usage) that
+    fails closed: any proxy error or unparseable ruling raises ReviewFailure, so
+    a garbled ruling can never produce a posted review."""
     if not settings.coord_proxy_url or not settings.coord_proxy_key:
         return None
 
@@ -299,15 +285,19 @@ def _proxy_judge(settings):
         return {
             "file": f.file, "line": f.line, "severity": f.severity,
             "verdict": f.verdict, "claim": f.claim, "suggestion": f.suggestion,
+            "evidence": f.evidence, "response": f.response,
         }
 
-    async def judge(left, right, round_no: int):
+    async def judge(left, right, round_no: int, round_cap: int):
         payload = json.dumps(
             {
+                "round": round_no,
+                "round_cap": round_cap,
                 "agent_1_findings": [_finding_payload(f) for f in left],
                 "agent_2_findings": [_finding_payload(f) for f in right],
             },
             indent=2,
+            ensure_ascii=False,
         )
         try:
             async with ProxyClient(
@@ -322,14 +312,14 @@ def _proxy_judge(settings):
                 )
         except Exception as exc:  # noqa: BLE001 - fail closed on ANY judge error
             raise ReviewFailure(
-                f"coordinator judge call failed in round {round_no}: {exc}",
+                f"judge call failed in round {round_no}: {exc}",
                 round_no=round_no, reason="judge call failed",
             ) from exc
         try:
             decision = parse_coordinator_decision(text)
         except ValueError as exc:
             raise ReviewFailure(
-                f"coordinator judge returned unparseable output in round {round_no}: {exc}",
+                f"judge returned unparseable output in round {round_no}: {exc}",
                 round_no=round_no, reason="judge output unparseable",
             ) from exc
         return decision, usage
