@@ -24,7 +24,7 @@ from app.config import config
 from app.db import SessionLocal
 from app.orm import User
 from app.proxy import ProxyNotConfigured, load_coordinator_proxy, ProxyClient
-from app.runner import ReviewDispatcher
+from app.review_queue import ReviewDispatcher
 from app.security import hash_password
 from sqlalchemy import func, select
 from app.webhooks import router as webhooks_router
@@ -101,18 +101,19 @@ async def _lifespan(app: FastAPI):
     await _seed_first_user()
     status = await _proxy_status()
     logger.info("inference proxy status at startup: %s", status)
-    yield
+    await app.state.review_dispatcher.start()
+    try:
+        yield
+    finally:
+        await app.state.review_dispatcher.stop()
 
 
 def create_app() -> FastAPI:
     _configure_logging()
     app = FastAPI(title="Agent Fight", version="0.1.0", lifespan=_lifespan)
 
-    # Fire-and-forget review runs are dispatched through this. Held on
-    # app.state so tests can swap in a recording fake. Concurrency is bounded
-    # (see config.review_concurrency) so a burst of PRs queues instead of
-    # spinning up unbounded review containers.
-    app.state.review_dispatcher = ReviewDispatcher(concurrency=config.review_concurrency)
+    # Single-process durable queue; preserve the existing concurrency setting.
+    app.state.review_dispatcher = ReviewDispatcher(max_parallel=config.review_concurrency)
 
     # Static assets (SVG marks, etc.). favicon.* keep dedicated root routes below.
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -136,7 +137,7 @@ def create_app() -> FastAPI:
     # ---- Public / health endpoints ------------------------------------------
     @app.get("/health")
     async def health():
-        return {"status": "healthy"}
+        return {"status": "healthy", "review_trigger": "pr_comment"}
 
     @app.get("/health/proxy")
     async def health_proxy():

@@ -3,10 +3,9 @@
 `session` is a plain in-memory database built from the ORM metadata, for
 unit tests against ORM/query logic directly.
 
-`client` wires a full FastAPI app (via `create_app()`) to a single shared
-in-memory SQLite connection (StaticPool, so every request sees the same
-database rather than a fresh empty one) and exposes it over an httpx
-AsyncClient. httpx persists cookies across requests on the same client
+`client` wires a full FastAPI app (via `create_app()`) to a temporary SQLite
+file, so concurrent HTTP requests and worker sessions have independent
+transactions, and exposes it over an httpx AsyncClient. httpx persists cookies across requests on the same client
 instance, so logging in via POST /login and then hitting an admin route
 carries the session cookie automatically — the same pattern a real browser
 session would follow.
@@ -17,7 +16,6 @@ from __future__ import annotations
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.pool import StaticPool
 
 from app.orm import Base, User
 from app.security import hash_password
@@ -39,14 +37,12 @@ async def session() -> AsyncSession:
 
 
 @pytest_asyncio.fixture
-async def client():
-    """An httpx AsyncClient wired to the app over a shared in-memory database,
+async def client(tmp_path):
+    """An httpx AsyncClient wired to the app over a temporary file database,
     pre-seeded with one operator account (ADMIN_USERNAME / ADMIN_PASSWORD)."""
     engine = create_async_engine(
-        "sqlite+aiosqlite://",
+        f"sqlite+aiosqlite:///{tmp_path / 'app.db'}",
         future=True,
-        poolclass=StaticPool,
-        connect_args={"check_same_thread": False},
     )
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -79,6 +75,7 @@ async def client():
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         ac.dispatcher = recorder  # type: ignore[attr-defined]
+        ac.sessions = maker
         yield ac
 
     await engine.dispose()
@@ -118,5 +115,26 @@ def sample_ado_payload(event_type: str = "git.pullrequest.created") -> dict:
                 "project": {"name": "widgets-project"},
             },
             "_links": {"web": {"href": "https://dev.azure.com/contoso/_git/widgets/pullrequest/42"}},
+        },
+    }
+
+
+def sample_comment_payload(content="/agent-fight review", comment_id=1, thread_id=5):
+    pr = sample_ado_payload()["resource"]
+    pr.update(status="active", lastMergeSourceCommit={"commitId": "a" * 40},
+              lastMergeTargetCommit={"commitId": "b" * 40})
+    return {
+        "id": "event-123",
+        "eventType": "ms.vss-code.git-pullrequest-comment-event",
+        "resource": {
+            "pullRequest": pr,
+            "comment": {
+                "id": comment_id, "content": content, "commentType": "text",
+                "author": {"id": "developer-id"},
+                "_links": {"self": {"href": (
+                    "https://dev.azure.com/contoso/widgets-project/_apis/git/"
+                    f"repositories/repo-guid-123/pullRequests/42/threads/{thread_id}/comments/{comment_id}"
+                )}},
+            },
         },
     }

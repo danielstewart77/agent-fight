@@ -50,6 +50,11 @@ class ReviewJob:
     # loop-guard against `pullrequest.updated` events fired by our own comment/
     # vote. Empty when the payload omits it.
     source_commit: str = ""
+    target_commit: str = ""
+    event_id: str = ""
+    thread_id: int = 0
+    comment_id: int = 0
+    requester_id: str = ""
 
 
 @dataclass(frozen=True)

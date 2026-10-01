@@ -303,7 +303,7 @@ async def prepare_repo(
     )
     steps = [
         (["git", "clone", clone_url, WORKDIR], None),
-        (["git", "-C", WORKDIR, "fetch", "origin", job.target_ref, source], None),
+        (["git", "-C", WORKDIR, "fetch", "origin", job.target_commit or job.target_ref, source], None),
         (checkout_argv, None),
         (["mkdir", "-p", FINDINGS_DIR], None),
     ]
@@ -342,7 +342,7 @@ async def compute_diff(handle: ContainerHandle, job: ReviewJob) -> str:
     a later fight round.
     """
     res = await handle.exec(
-        ["git", "-C", WORKDIR, "diff", f"origin/{job.target_branch}...{job.source_commit or job.source_branch}"],
+        ["git", "-C", WORKDIR, "diff", f"{job.target_commit or 'origin/' + job.target_branch}...{job.source_commit or job.source_branch}"],
     )
     if not res.ok:
         raise RuntimeError(f"git diff failed: {res.stderr.strip()}")

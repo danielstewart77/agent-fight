@@ -11,6 +11,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 import asyncio
 import json
+from dataclasses import asdict, replace
+from uuid import uuid4
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -18,7 +20,7 @@ from sqlalchemy.orm import selectinload
 from app.auth import require_login
 from app.db import get_session
 from app.ado import AdoClient, parse_pull_request_event
-from app.orm import Review, ReviewEvent, Settings
+from app.orm import Review, ReviewEvent, ReviewRequest, Settings
 from app.db import SessionLocal
 from app.templating import templates
 
@@ -143,7 +145,10 @@ async def retry_review(
     job = parse_pull_request_event(
         {"eventType": "git.pullrequest.updated", "resource": pr}, settings
     )
-    request.app.state.review_dispatcher.dispatch(job)
+    job = replace(job, event_type="manual.retry")
+    session.add(ReviewRequest(request_key=f"manual:{uuid4().hex}",
+                              job_json=json.dumps(asdict(job)), status="pending"))
+    await session.commit()
     return RedirectResponse(f"/admin/reviews/{review_id}?retry=queued", status_code=303)
 
 def _event_json(e):

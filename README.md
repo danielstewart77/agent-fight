@@ -23,10 +23,84 @@ The harnesses connect to the proxy the way the proxy's own installers do
 Codex via `~/.codex/auth.json` + `~/.codex/config.toml` (a custom
 `azure_proxy` provider) written into the review container.
 
-The webhook receiver at `/webhooks/ado` authenticates the inbound call, parses
-the ADO PR service-hook payload into a `ReviewJob`, and dispatches the review
-run in the background (returning `202` immediately). The pipeline itself is
-built:
+## On-demand PR reviews
+
+Post this as the entire text of a new PR comment (or reply):
+
+```text
+/agent-fight review
+```
+
+The same command requests both initial reviews and re-reviews. Developers use
+their existing ADO accounts; no Agent Fight login or new Entra app
+registration is needed. Existing review voting behavior is preserved. Anyone permitted to comment on
+a PR covered by the subscription can request a review. An explicit command on
+an active draft PR is also allowed.
+
+Agent Fight replies to the command with queued/running/completed/failed status
+and posts a new numbered review thread, preserving production review history. Each accepted request pins
+the source and target commit IDs read from ADO when the request is prepared;
+the acknowledgment and results identify that revision. Later pushes do not
+start reviews or change a queued review's commits. Post a **new comment** for
+another review, even if the code has not changed. Editing or redelivering an
+already accepted command never requests a second run. Quoted commands, code
+blocks, normal discussion, and Agent Fight's own replies are ignored.
+
+### ADO service hook setup
+
+In **Project settings → Service hooks**, create a **Web Hooks** subscription:
+
+- Event: **Pull request commented on** (`ms.vss-code.git-pullrequest-comment-event`).
+- Repository/target branch: select the intended scope (all repositories if desired).
+- URL: the existing externally reachable Agent Fight URL plus `/webhooks/ado`.
+- HTTP header: `X-Webhook-Secret: <the secret configured in /admin/settings>`.
+- Send full resource details (resource version `2.0` when creating through the API).
+
+Keep the existing ADO organization/PAT and clone credentials. The PAT needs
+repository/PR read access and PR comment create/update permission. Outbound
+comments appear under the PAT owner's identity. Commands from that same person
+are allowed; self-trigger prevention uses command syntax, not author identity.
+
+Deploy the new code and run the database migration **before** enabling the new
+subscription. Then disable the old **Pull request created** and **Pull request
+updated** subscriptions. The handler also ignores these old events, so stale
+subscriptions cannot cause automatic reviews after deployment. ADO's canned
+test payload may be ignored because it doesn't contain the command; verify
+delivery with a real command on a test PR.
+
+Alternatively, `scripts/switch_comment_hook.py` can copy the existing endpoint
+options and shared secret into the new subscription. Set `AZURE_DEVOPS_EXT_PAT`
+to a PAT with service-hook management permission and run:
+
+```powershell
+python scripts/switch_comment_hook.py --organization ORG --project-id PROJECT_GUID --webhook-url https://HOST/webhooks/ado
+```
+
+This previews the change. Add `--apply` after deployment to enable the comment
+subscription and disable the matching legacy subscriptions. The script checks
+the new service's health capability before changing anything and doesn't print
+credentials. It preserves repository/branch scope. The old PR-author filter is
+not available on comment events: any permitted commenter in that scope can
+request a review.
+
+### Queue and recovery
+
+The webhook commits a durable request to SQLite before returning `202`.
+Duplicates are identified by organization/repository/PR/thread/comment, not
+commit or event ID. The worker verifies the live comment and PR through ADO
+before acknowledging. Requests for the same PR run in order, bounded by the existing `REVIEW_CONCURRENCY` setting. Admin retries use this same queue. Waiting requests are acknowledged independently.
+Closed PRs are skipped, including PRs closed while a review is running.
+
+Use **one application process/replica per database**, as the supplied entrypoint
+does. The scheduling and concurrency limit are process-local. Preserve the
+`data` volume. Pending and queued requests resume after restart; interrupted
+running reviews are marked failed and require a fresh command, avoiding an
+automatic replay after a result might already have been posted. Failures are
+logged server-side and reported on the request when ADO is reachable. An ADO
+outage can prevent that notification; the durable request status remains in
+`review_requests`. Completed requests remain as the deduplication history.
+
+The review pipeline consists of:
 
 - `app/ado.py` — parse the PR webhook payload; `fetch_pr_context` (description,
   work items, and every comment thread + reply, rendered for the reviewers);

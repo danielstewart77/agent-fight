@@ -93,8 +93,8 @@ def test_docker_run_argv_no_mounts():
 
 async def test_run_timeout_resets_on_output_activity():
     result = await _run(
-        [sys.executable, "-u", "-c", "import time; [(print(i), time.sleep(.04)) for i in range(5)]"],
-        timeout=.08,
+        [sys.executable, "-u", "-c", "import time; [(print(i), time.sleep(.15)) for i in range(6)]"],
+        timeout=.5,
     )
     assert result.ok and "4" in result.stdout
 
@@ -107,6 +107,17 @@ async def test_run_timeout_kills_silent_process():
 async def test_compute_diff_returns_stdout():
     handle = FakeHandle(exec_results={"git -C /work/repo diff": ExecResult(rc=0, stdout="DIFFTEXT")})
     assert await compute_diff(handle, _job()) == "DIFFTEXT"
+
+
+async def test_both_requested_commits_are_pinned():
+    from dataclasses import replace
+    job = replace(_job(), source_commit="a" * 40, target_commit="b" * 40)
+    handle = FakeHandle()
+    await prepare_repo(handle, job, clone_credential_kind="token", clone_credential_secret=None)
+    await compute_diff(handle, job)
+    assert ["git", "-C", "/work/repo", "checkout", "--detach", "a" * 40] in handle.exec_log
+    assert ["git", "-C", "/work/repo", "fetch", "origin", "b" * 40, "a" * 40] in handle.exec_log
+    assert ["git", "-C", "/work/repo", "diff", "b" * 40 + "..." + "a" * 40] in handle.exec_log
 
 
 async def test_provision_harnesses_writes_codex_files():

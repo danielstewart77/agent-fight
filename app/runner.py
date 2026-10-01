@@ -1,18 +1,6 @@
-"""Fire-and-forget dispatch of review runs off the webhook request path.
+"""Execute reviews with production history, live progress, usage and findings.
 
-A review run is minutes long (clone, multiple harness rounds, post-back), so
-the webhook must return its 202 immediately and let the run proceed in the
-background. `ReviewDispatcher.dispatch` schedules an asyncio task, retains a
-reference so it is not garbage-collected mid-flight, and logs any exception via
-a done-callback.
-
-This is the prototype-grade seam: a production deployment would swap the
-in-process task for a real queue/worker, but the `dispatch(job)` interface
-stays the same. The actual run is behind `self._run`, injectable so tests use a
-recording fake instead of spinning up Docker.
-
-ASSUMPTION: a single uvicorn worker, so in-process background tasks are an
-acceptable execution model for now.
+Request scheduling lives in app.review_queue.
 """
 
 from __future__ import annotations
@@ -77,7 +65,7 @@ def describe_review_failure(exc: Exception) -> str:
     elif any(marker in text for marker in ("couldn't find remote ref", "not our ref", "reference is not a tree")):
         source = "Repository checkout"
         happened = "Azure DevOps no longer exposes the source branch or commit from this webhook event."
-        action = "Push or restore the source commit and trigger a new PR update; an old event cannot be reviewed."
+        action = "Push or restore the source commit and post a new /agent-fight review command; an old event cannot be reviewed."
     elif "repo prep step" in text or "git clone" in text or "git fetch" in text:
         source = "Repository checkout"
         happened = "The repository could not be cloned or prepared for review."
@@ -93,39 +81,6 @@ def _utcnow() -> datetime:
 
 
 RunFn = Callable[[ReviewJob], Awaitable[None]]
-
-
-class ReviewDispatcher:
-    """Fire-and-forget dispatch with a bounded concurrency cap.
-
-    Every webhook still returns 202 immediately; the review task is created at
-    once but blocks on a semaphore, so at most `concurrency` reviews actually run
-    at a time and the rest queue (FIFO-ish) and start as slots free. This keeps a
-    burst of PRs from spinning up unbounded containers / hammering the proxy."""
-
-    def __init__(self, run: Optional[RunFn] = None, *, concurrency: int = 5) -> None:
-        self._run = run or _default_run
-        self._tasks: set[asyncio.Task] = set()
-        self._sem = asyncio.Semaphore(max(1, concurrency))
-        self._concurrency = max(1, concurrency)
-
-    def dispatch(self, job: ReviewJob) -> None:
-        task = asyncio.create_task(self._guarded(job))
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
-
-    async def _guarded(self, job: ReviewJob) -> None:
-        # If all slots are busy, this waits here (the PR is queued) rather than
-        # starting yet another concurrent review.
-        if self._sem.locked():
-            logger.info(
-                "PR %s queued — %s review slots busy", job.pr_id, self._concurrency
-            )
-        async with self._sem:
-            try:
-                await self._run(job)
-            except Exception:  # noqa: BLE001 - background task; log, don't crash the loop
-                logger.exception("review run failed for PR %s", job.pr_id)
 
 
 async def _default_run(job: ReviewJob) -> None:
@@ -245,7 +200,7 @@ async def run_and_record(
         outcome = await run_review(
             job, settings, runner=runner, ado_client=ado_client, judge=judge, progress=progress,
         )
-    except Exception as exc:  # noqa: BLE001 - record failure, DO NOT post, re-raise to log
+    except (Exception, asyncio.CancelledError) as exc:  # record interrupted runs as well
         # A failed run is recorded as `failed` and NOTHING is posted to the PR
         # (run_review raises before its post-back). This is the guarantee that a
         # broken review can never look successful. See coordinator.ReviewFailure.

@@ -2,6 +2,11 @@
 {% block title %}Settings — Agent Fight{% endblock %}
 {% block content %}
 <h1>Settings</h1>
+<p>To request a review or re-review, post <code>/agent-fight review</code> as the entire
+   comment on an active Azure DevOps PR. Configure a <strong>Pull request commented on</strong>
+   service hook to <code>/webhooks/ado</code> with the shared secret below.
+   PR creation and pushes do not trigger reviews.</p>
+
 <p>Run configuration for the code-review consensus loop: the round cap, the
    Azure DevOps account/org/project connection and its PAT, the webhook
    shared secret used to authenticate inbound ADO calls, and the clone

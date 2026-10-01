@@ -854,7 +854,9 @@ async def run_review(
 
         review_md = synthesize_final_review(
             agreed, disagreed, unmatched,
-            reviewed=f"`{job.source_branch}` → `{job.target_branch}`",
+            reviewed=(f"`{job.source_branch}` → `{job.target_branch}`"
+                      + (f" at source `{job.source_commit}`, target `{job.target_commit}`"
+                         if job.target_commit else "")),
         )
         review_md += f"\n\n---\n**Reviewer vote:** {vote_label(vote)} — {vote_reason}\n"
 

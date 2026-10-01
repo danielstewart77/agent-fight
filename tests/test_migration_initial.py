@@ -9,7 +9,7 @@ from alembic.config import Config as AlembicConfig
 from sqlalchemy import create_engine, inspect
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-EXPECTED_TABLES = {"settings"}
+EXPECTED_TABLES = {"settings", "review_requests"}
 EXPECTED_SETTINGS_COLUMNS = {
     "id",
     "round_cap",

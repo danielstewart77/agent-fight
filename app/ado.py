@@ -16,11 +16,13 @@ endpoint, and PAT Basic-auth (`base64(":" + pat)`).
 from __future__ import annotations
 
 import base64
+import hashlib
+from dataclasses import replace
 import html
 import logging
 import re
 from typing import Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import httpx
 
@@ -31,6 +33,8 @@ logger = logging.getLogger("agent_fight.ado")
 
 SUPPORTED_EVENTS = ("git.pullrequest.created", "git.pullrequest.updated")
 ADO_API_VERSION = "7.1"
+COMMENT_EVENT = "ms.vss-code.git-pullrequest-comment-event"
+REVIEW_COMMAND = "/agent-fight review"
 
 # Prepended to every posted review. REVIEW_MARKER is a stable substring of the
 # header used to recognise our own threads on a PR — to count them (so a
@@ -56,7 +60,7 @@ def review_header(revision: int) -> str:
         return REVIEW_HEADER
     return (
         f"**Agent🥊🤖🥊Fight - consensus review (re-review #{revision})** — the PR "
-        "changed, so Claude + Codex reviewed it again independently and debated "
+        "was submitted for another review; Claude + Codex reviewed it independently and debated "
         "to convergence. This supersedes our earlier review comment(s) here.\n\n"
     )
 
@@ -67,6 +71,57 @@ class UnsupportedEvent(ValueError):
 
 class MalformedPayload(ValueError):
     """A required field is missing or the wrong type."""
+
+
+def _object(value, path):
+    if not isinstance(value, dict):
+        raise MalformedPayload(f"{path} must be an object")
+    return value
+
+
+def is_review_command(comment: dict) -> bool:
+    return (
+        not comment.get("isDeleted")
+        and comment.get("commentType") in (1, "text")
+        and isinstance(comment.get("content"), str)
+        and comment["content"].strip() == REVIEW_COMMAND
+    )
+
+
+def request_key(job: ReviewJob) -> str:
+    # Event IDs can change on comment edits; a comment is a request only once.
+    identity = f"{job.organization.lower()}/{job.repo_id.lower()}/{job.pr_id}/{job.thread_id}/{job.comment_id}"
+    return hashlib.sha256(identity.encode()).hexdigest()
+
+
+def parse_comment_event(payload: dict, settings: Settings) -> ReviewJob:
+    _object(payload, "payload")
+    if payload.get("eventType") != COMMENT_EVENT:
+        raise UnsupportedEvent("only PR comment commands request reviews")
+    resource = _object(payload.get("resource"), "resource")
+    comment = _object(resource.get("comment"), "resource.comment")
+    if not is_review_command(comment):
+        raise UnsupportedEvent("not a review command")
+    pr = _object(resource.get("pullRequest"), "resource.pullRequest")
+    if pr.get("status") != "active":
+        raise UnsupportedEvent("pull request is not active")
+    job = parse_pull_request_event({"eventType": "git.pullrequest.created", "resource": pr}, settings)
+    author = _object(comment.get("author"), "resource.comment.author")
+    requester = _require(author, "id", "resource.comment.author.id")
+    links = _object(comment.get("_links"), "resource.comment._links")
+    self_link = _object(links.get("self"), "resource.comment._links.self")
+    href = self_link.get("href")
+    if not isinstance(href, str):
+        raise MalformedPayload("comment self link is missing")
+    # Extract identifiers only. Never send credentials to a webhook-supplied link.
+    match = re.search(r"/repositories/([^/]+)/pullRequests/(\d+)/threads/(\d+)/comments/(\d+)/?$",
+                      urlparse(href).path, re.IGNORECASE)
+    if (not match or match[1].lower() != job.repo_id.lower()
+            or int(match[2]) != job.pr_id or str(comment.get("id")) != match[4]
+            or int(match[3]) <= 0 or int(match[4]) <= 0):
+        raise MalformedPayload("comment self link does not identify this PR and comment")
+    return replace(job, event_type=COMMENT_EVENT, event_id=str(payload.get("id") or ""),
+                   thread_id=int(match[3]), comment_id=int(match[4]), requester_id=str(requester))
 
 
 def _strip_ref(ref: str) -> str:
@@ -95,8 +150,8 @@ def parse_pull_request_event(payload: dict, settings: Settings) -> ReviewJob:
     if event_type not in SUPPORTED_EVENTS:
         raise UnsupportedEvent(f"unsupported eventType: {event_type!r}")
 
-    resource = _require(payload, "resource", "resource")
-    repository = _require(resource, "repository", "resource.repository")
+    resource = _object(_require(payload, "resource", "resource"), "resource")
+    repository = _object(_require(resource, "repository", "resource.repository"), "resource.repository")
 
     pr_id_raw = _require(resource, "pullRequestId", "resource.pullRequestId")
     try:
@@ -185,6 +240,7 @@ class AdoClient:
         self._client = client
         self._owns_client = client is None
         self._timeout = timeout
+        self._identity = None
 
     def _http(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -209,6 +265,83 @@ class AdoClient:
         if resp.status_code // 100 != 2:
             raise RuntimeError(f"ADO {what} failed {resp.status_code}: {resp.text[:300]}")
         return resp.json()
+
+    def _pr_url(self, job: ReviewJob, suffix: str = "") -> str:
+        return (
+            f"https://dev.azure.com/{quote(job.organization, safe='')}/{quote(job.project, safe='')}"
+            f"/_apis/git/repositories/{quote(job.repo_id, safe='')}"
+            f"/pullRequests/{job.pr_id}{suffix}?api-version={ADO_API_VERSION}"
+        )
+
+
+    async def _get(self, settings: Settings, url: str) -> dict:
+        response = await self._http().get(url, headers=self._headers(settings))
+        response.raise_for_status()
+        return response.json()
+
+
+    async def _authenticated_id(self, settings: Settings) -> str:
+        cached = self._identity
+        if cached and cached[:2] == (settings.ado_organization, settings.ado_pat):
+            return cached[2]
+        data = await self._get(settings,
+            f"https://dev.azure.com/{quote(settings.ado_organization, safe='')}"
+            "/_apis/connectionData?api-version=7.1-preview.1")
+        identity = data["authenticatedUser"]["id"]
+        self._identity = (settings.ado_organization, settings.ado_pat, identity)
+        return identity
+
+
+    async def prepare_request(self, settings: Settings, job: ReviewJob) -> ReviewJob:
+        """Verify the live command and resolve the exact commits before acknowledging."""
+        if job.comment_id:
+            comment = await self._get(settings, self._threads_url(
+                job, f"/{job.thread_id}/comments/{job.comment_id}"))
+            if (not is_review_command(comment)
+                    or (comment.get("author") or {}).get("id") != job.requester_id):
+                raise UnsupportedEvent("request comment was deleted or changed")
+        pr = await self._get(settings, self._pr_url(job))
+        if pr.get("status") != "active":
+            raise UnsupportedEvent("pull request is no longer active")
+        source = (pr.get("lastMergeSourceCommit") or {}).get("commitId", "")
+        target = (pr.get("lastMergeTargetCommit") or {}).get("commitId", "")
+        if not all(isinstance(sha, str) and re.fullmatch(r"[a-fA-F0-9]{40}", sha)
+                   for sha in (source, target)):
+            raise RuntimeError("ADO did not return source and target commit IDs")
+        current = parse_pull_request_event({"eventType": "git.pullrequest.created", "resource": pr}, settings)
+        if current.pr_id != job.pr_id or current.repo_id.lower() != job.repo_id.lower():
+            raise RuntimeError("ADO returned a different pull request")
+        return replace(current, event_type=COMMENT_EVENT, event_id=job.event_id,
+                       thread_id=job.thread_id, comment_id=job.comment_id,
+                       requester_id=job.requester_id, source_commit=source, target_commit=target)
+
+
+    async def ensure_active(self, settings: Settings, job: ReviewJob) -> None:
+        pr = await self._get(settings, self._pr_url(job))
+        if pr.get("status") != "active":
+            raise UnsupportedEvent("pull request is no longer active")
+
+
+    async def request_status(self, settings: Settings, job: ReviewJob, message: str) -> None:
+        """One evolving reply to the command, recoverable after a service restart."""
+        marker = f"<!-- agent-fight-request:{request_key(job)} -->"
+        author_id = await self._authenticated_id(settings)
+        thread = await self._get(settings, self._threads_url(job, f"/{job.thread_id}"))
+        content = f"**Agent Fight** — {message}\n\n{marker}"
+        existing = next((c for c in thread.get("comments", [])
+                         if not c.get("isDeleted") and (c.get("author") or {}).get("id") == author_id
+                         and (c.get("content") or "").startswith("**Agent Fight** — ")
+                         and (c.get("content") or "").endswith(marker)), None)
+        if existing:
+            response = await self._http().patch(
+                self._threads_url(job, f"/{job.thread_id}/comments/{existing['id']}"),
+                headers=self._headers(settings), json={"content": content})
+        else:
+            response = await self._http().post(
+                self._threads_url(job, f"/{job.thread_id}/comments"), headers=self._headers(settings),
+                json={"parentCommentId": job.comment_id, "content": content, "commentType": 1})
+        response.raise_for_status()
+
 
     async def fetch_pull_request(self, settings: Settings, pr_id: int) -> dict:
         """Fetch the current PR resource used to build a manual-retry job."""
@@ -380,6 +513,8 @@ class AdoClient:
         except Exception as exc:  # noqa: BLE001 - numbering is cosmetic, the review is not
             logger.warning("PR %s: could not count prior review threads: %s", job.pr_id, exc)
             revision = 1
+        if job.event_type in (COMMENT_EVENT, "manual.retry"):
+            await self.ensure_active(settings, job)
         await self._create_review_thread(settings, job, review_header(revision) + review_markdown)
         return revision
 

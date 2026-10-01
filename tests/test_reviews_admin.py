@@ -1,6 +1,7 @@
 """Admin reviews pages render (empty state) and the dashboard shows metric tiles."""
 
 from __future__ import annotations
+from sqlalchemy import select
 
 from tests.conftest import login
 from app.orm import Review, ReviewEvent, ReviewFinding, Settings
@@ -40,15 +41,13 @@ async def test_reviews_requires_login(client):
 async def test_running_review_detail_shows_progress_timeline(client):
     await login(client)
     # Use the application's overridden session dependency.
-    override = next(iter(client._transport.app.dependency_overrides.values()))
-    async for session in override():
+    async with client.sessions() as session:
         review = Review(pr_id=7, repo_name="repo", status="running",
                         current_phase="independent_review", status_message="Claude reviewing")
         session.add(review); await session.flush()
         session.add(ReviewEvent(review_id=review.id, kind="agent_started",
                                 phase="independent_review", message="Claude reviewing"))
         await session.commit(); rid = review.id
-        break
     resp = await client.get(f"/admin/reviews/{rid}")
     assert resp.status_code == 200
     assert "Progress" in resp.text and "Claude reviewing" in resp.text
@@ -57,13 +56,11 @@ async def test_running_review_detail_shows_progress_timeline(client):
 
 async def test_failed_review_shows_clean_summary_and_collapsed_traceback(client):
     await login(client)
-    override = next(iter(client._transport.app.dependency_overrides.values()))
-    async for session in override():
+    async with client.sessions() as session:
         review = Review(pr_id=8, repo_name="repo", status="failed", created_by="Ada Lovelace",
                         status_message="Source: Claude review agent\nWhat happened: Connection dropped.\nNext step: Retry.",
                         error="Traceback: noisy internals")
         session.add(review); await session.commit(); rid = review.id
-        break
     resp = await client.get(f"/admin/reviews/{rid}")
     assert resp.status_code == 200
     assert "Source: Claude review agent" in resp.text
@@ -75,8 +72,7 @@ async def test_failed_review_shows_clean_summary_and_collapsed_traceback(client)
 
 async def test_review_detail_renders_posted_markdown_as_sanitized_html(client):
     await login(client)
-    override = next(iter(client._transport.app.dependency_overrides.values()))
-    async for session in override():
+    async with client.sessions() as session:
         review = Review(
             pr_id=9,
             repo_name="repo",
@@ -89,7 +85,6 @@ async def test_review_detail_renders_posted_markdown_as_sanitized_html(client):
         session.add(review)
         await session.commit()
         rid = review.id
-        break
 
     resp = await client.get(f"/admin/reviews/{rid}")
 
@@ -103,8 +98,7 @@ async def test_review_detail_renders_posted_markdown_as_sanitized_html(client):
 
 async def test_agent_findings_render_as_a_structured_chat_thread(client):
     await login(client)
-    override = next(iter(client._transport.app.dependency_overrides.values()))
-    async for session in override():
+    async with client.sessions() as session:
         review = Review(pr_id=10, repo_name="repo", status="converged")
         session.add(review)
         await session.flush()
@@ -128,7 +122,6 @@ async def test_agent_findings_render_as_a_structured_chat_thread(client):
         ])
         await session.commit()
         rid = review.id
-        break
 
     resp = await client.get(f"/admin/reviews/{rid}")
 
@@ -146,12 +139,10 @@ async def test_agent_findings_render_as_a_structured_chat_thread(client):
 
 async def test_manual_retry_fetches_current_pr_and_dispatches(client, monkeypatch):
     await login(client)
-    override = next(iter(client._transport.app.dependency_overrides.values()))
-    async for session in override():
+    async with client.sessions() as session:
         session.add(Settings(id=1, ado_organization="contoso", ado_project="widgets", ado_pat="pat"))
         review = Review(pr_id=42, repo_name="repo", status="failed", error="boom")
         session.add(review); await session.commit(); rid = review.id
-        break
 
     payload = sample_ado_payload()
     payload["resource"]["status"] = "active"
@@ -164,5 +155,10 @@ async def test_manual_retry_fetches_current_pr_and_dispatches(client, monkeypatc
     resp = await client.post(f"/admin/reviews/{rid}/retry", follow_redirects=False)
     assert resp.status_code == 303
     assert resp.headers["location"].endswith("?retry=queued")
-    assert len(client.dispatcher.jobs) == 1
-    assert client.dispatcher.jobs[0].created_by == "Ada Lovelace"
+    import json
+    from app.orm import ReviewRequest
+    async with client.sessions() as session:
+        queued = (await session.scalars(select(ReviewRequest))).one()
+        job = json.loads(queued.job_json)
+    assert job["created_by"] == "Ada Lovelace"
+    assert job["event_type"] == "manual.retry"

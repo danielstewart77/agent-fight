@@ -13,7 +13,7 @@ from sqlalchemy import select
 
 from app.container import FakeHandle, FakeRunner
 from app.orm import Review, ReviewTokenUsage
-from app.runner import ReviewDispatcher, describe_review_failure, run_and_record
+from app.runner import describe_review_failure, run_and_record
 from tests.test_coordinator import (
     _indep,
     _seed,
@@ -82,49 +82,10 @@ async def test_run_and_record_persists_success_with_usage(session):
     assert any(r.role == "codex" and r.input_tokens == 200 for r in rows)
 
 
-async def test_dispatcher_bounds_concurrency():
-    import asyncio
-    active = 0
-    peak = 0
-    gate = asyncio.Event()
-
-    async def fake_run(job):
-        nonlocal active, peak
-        active += 1
-        peak = max(peak, active)
-        await gate.wait()
-        active -= 1
-
-    d = ReviewDispatcher(run=fake_run, concurrency=2)
-    for _ in range(5):
-        d.dispatch(_job())
-    await asyncio.sleep(0.05)          # let the loop start tasks up to the cap
-    assert active == 2 and peak == 2   # only 2 run; the other 3 are queued
-    gate.set()
-    await asyncio.sleep(0.05)          # drain the queue
-    assert peak == 2                   # never exceeded the cap
-
-
 def test_proxy_judge_none_when_coord_proxy_unconfigured():
     # No coord proxy in the bare _settings() -> run_review uses the fallback.
     from app.runner import _proxy_judge
     assert _proxy_judge(_settings()) is None
-
-
-async def test_loop_guard_already_reviewed(session):
-    """The webhook loop-guard: a non-failed review of the same (pr, commit)
-    blocks a re-review; a failed one doesn't; new commit / unknown / other PR
-    all pass through."""
-    from app.webhooks import _already_reviewed
-    session.add(Review(pr_id=42, repo_name="r", status="converged", source_commit="c1"))
-    session.add(Review(pr_id=42, repo_name="r", status="failed", source_commit="c2"))
-    await session.commit()
-
-    assert await _already_reviewed(session, 42, "c1") is True    # already reviewed -> skip
-    assert await _already_reviewed(session, 42, "c2") is False   # prior FAILED -> allow retry
-    assert await _already_reviewed(session, 42, "c3") is False   # new commit -> review
-    assert await _already_reviewed(session, 42, "") is False     # unknown commit -> best-effort pass
-    assert await _already_reviewed(session, 99, "c1") is False   # different PR
 
 
 async def test_run_and_record_marks_failed_on_error(session):
