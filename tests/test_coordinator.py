@@ -17,6 +17,7 @@ from app.container import (
     FakeRunner,
 )
 from app.coordinator import (
+    HARNESS_INACTIVITY_TIMEOUT,
     build_fight_prompt,
     build_independent_prompt,
     convergence,
@@ -339,9 +340,9 @@ class _RecordingAdo:
         self.context_fetched = True
         return f"# Pull request !{job.pr_id}\n\n## Comment threads (0)\n"
 
-    async def post_or_update_pr_review(self, settings, job, review_md):
+    async def post_pr_review(self, settings, job, review_md):
         self.posted = review_md
-        return "created"
+        return 1
 
     async def set_pr_vote(self, settings, job, vote):
         self.voted = vote
@@ -453,6 +454,24 @@ async def test_default_fallback_judge_converges_on_agreement():
 
 
 # --- fail-closed: a broken run must NEVER post a (false) clean/consensus ---- #
+
+
+async def test_harness_inactivity_timeout_is_30_minutes_and_is_not_automatically_retried():
+    class TimeoutHandle(FakeHandle):
+        calls = 0
+
+        async def exec(self, argv, **kwargs):
+            if argv and argv[0] == "claude":
+                self.calls += 1
+                raise TimeoutError
+            return await super().exec(argv, **kwargs)
+
+    handle = TimeoutHandle()
+    with pytest.raises(ReviewFailure) as ei:
+        await run_review(_job(), _settings(), runner=FakeRunner(handle), ado_client=_RecordingAdo())
+    assert HARNESS_INACTIVITY_TIMEOUT == 30 * 60
+    assert handle.calls == 1
+    assert "no output for 30 minutes" in str(ei.value)
 
 
 async def test_harness_nonzero_exit_aborts_and_does_not_post():

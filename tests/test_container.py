@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import pytest
 
 from app.container import (
@@ -10,6 +11,7 @@ from app.container import (
     _clone_url_with_token,
     compute_diff,
     prepare_repo,
+    _run,
 )
 from app.ado import parse_pull_request_event
 from app.orm import Settings
@@ -35,9 +37,21 @@ async def test_prepare_repo_token_embeds_into_clone_url():
     )
     clone_cmd = next(c for c in handle.exec_log if c[:2] == ["git", "clone"])
     assert "TOK@" in clone_cmd[2]
-    # Fetch names both refs; checkout uses the short branch; findings dir made.
+    # Fetch names both refs; findings dir made.
     assert any("fetch" in c for c in handle.exec_log)
     assert ["mkdir", "-p", "/work/findings"] in handle.exec_log
+
+
+async def test_prepare_repo_uses_webhook_commit_when_available():
+    handle = FakeHandle()
+    job = _job()
+    from dataclasses import replace
+    job = replace(job, source_commit="abc123")
+    await prepare_repo(handle, job, clone_credential_kind="none", clone_credential_secret=None)
+    fetch = next(c for c in handle.exec_log if "fetch" in c)
+    checkout = next(c for c in handle.exec_log if "checkout" in c)
+    assert fetch[-1] == "abc123"
+    assert checkout[-2:] == ["--detach", "abc123"]
 
 
 async def test_prepare_repo_ssh_writes_key_and_sets_git_ssh_command():
@@ -75,6 +89,19 @@ def test_docker_run_argv_no_mounts():
     from app.container import _docker_run_argv
 
     assert _docker_run_argv("img", []) == ["docker", "run", "-d", "--rm", "img", "sleep", "infinity"]
+
+
+async def test_run_timeout_resets_on_output_activity():
+    result = await _run(
+        [sys.executable, "-u", "-c", "import time; [(print(i), time.sleep(.04)) for i in range(5)]"],
+        timeout=.08,
+    )
+    assert result.ok and "4" in result.stdout
+
+
+async def test_run_timeout_kills_silent_process():
+    with pytest.raises(TimeoutError):
+        await _run([sys.executable, "-c", "import time; time.sleep(.2)"], timeout=.05)
 
 
 async def test_compute_diff_returns_stdout():

@@ -87,6 +87,12 @@ class ContainerRunner(Protocol):
 async def _run(
     argv: list[str], *, stdin: Optional[str] = None, timeout: Optional[float] = None
 ) -> ExecResult:
+    """Run a process, treating ``timeout`` as maximum output inactivity.
+
+    The clock resets whenever stdout or stderr yields bytes. This lets a
+    productive long-running agent continue while still killing a process that
+    has gone completely silent.
+    """
     proc = await asyncio.create_subprocess_exec(
         *argv,
         stdin=asyncio.subprocess.PIPE if stdin is not None else None,
@@ -94,16 +100,48 @@ async def _run(
         stderr=asyncio.subprocess.PIPE,
     )
     feed = stdin.encode("utf-8") if stdin is not None else None
+    stdout = bytearray()
+    stderr = bytearray()
+    tasks: dict[asyncio.Task, tuple[str, object]] = {}
     try:
-        out, err = await asyncio.wait_for(proc.communicate(feed), timeout=timeout)
-    except asyncio.TimeoutError:
-        proc.kill()
+        if feed is not None and proc.stdin is not None:
+            proc.stdin.write(feed)
+            await proc.stdin.drain()
+            proc.stdin.close()
+
+        assert proc.stdout is not None and proc.stderr is not None
+        tasks[asyncio.create_task(proc.stdout.read(65536))] = ("stdout", proc.stdout)
+        tasks[asyncio.create_task(proc.stderr.read(65536))] = ("stderr", proc.stderr)
+        wait_task = asyncio.create_task(proc.wait())
+        tasks[wait_task] = ("process", proc)
+
+        while tasks:
+            done, _ = await asyncio.wait(
+                tasks, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
+            )
+            if not done:
+                raise asyncio.TimeoutError
+            for task in done:
+                kind, stream = tasks.pop(task)
+                result = task.result()
+                if kind == "process":
+                    continue
+                data = result
+                if data:
+                    (stdout if kind == "stdout" else stderr).extend(data)
+                    tasks[asyncio.create_task(stream.read(65536))] = (kind, stream)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        for task in tasks:
+            task.cancel()
+        if proc.returncode is None:
+            proc.kill()
         await proc.wait()
+        await asyncio.gather(*tasks, return_exceptions=True)
         raise
     return ExecResult(
         rc=proc.returncode if proc.returncode is not None else -1,
-        stdout=out.decode("utf-8", "replace"),
-        stderr=err.decode("utf-8", "replace"),
+        stdout=stdout.decode("utf-8", "replace"),
+        stderr=stderr.decode("utf-8", "replace"),
     )
 
 
@@ -253,10 +291,20 @@ async def prepare_repo(
         await handle.exec(["chmod", "600", key_path])
         env["GIT_SSH_COMMAND"] = f"ssh -i {key_path} -o StrictHostKeyChecking=no"
 
+    # Prefer the immutable source SHA carried by the webhook.  ADO commonly
+    # deletes the source branch when a PR completes, but the commit remains
+    # fetchable; reviewing by SHA also prevents a force-push between webhook
+    # receipt and checkout from changing the code under review.
+    source = job.source_commit or job.source_ref
+    checkout_argv = (
+        ["git", "-C", WORKDIR, "checkout", "--detach", job.source_commit]
+        if job.source_commit
+        else ["git", "-C", WORKDIR, "checkout", job.source_branch]
+    )
     steps = [
         (["git", "clone", clone_url, WORKDIR], None),
-        (["git", "-C", WORKDIR, "fetch", "origin", job.target_ref, job.source_ref], None),
-        (["git", "-C", WORKDIR, "checkout", job.source_branch], None),
+        (["git", "-C", WORKDIR, "fetch", "origin", job.target_ref, source], None),
+        (checkout_argv, None),
         (["mkdir", "-p", FINDINGS_DIR], None),
     ]
     for argv, _ in steps:
@@ -294,7 +342,7 @@ async def compute_diff(handle: ContainerHandle, job: ReviewJob) -> str:
     a later fight round.
     """
     res = await handle.exec(
-        ["git", "-C", WORKDIR, "diff", f"origin/{job.target_branch}...{job.source_branch}"],
+        ["git", "-C", WORKDIR, "diff", f"origin/{job.target_branch}...{job.source_commit or job.source_branch}"],
     )
     if not res.ok:
         raise RuntimeError(f"git diff failed: {res.stderr.strip()}")

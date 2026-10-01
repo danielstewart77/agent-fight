@@ -163,6 +163,7 @@ class Review(Base):
     source_branch: Mapped[Optional[str]] = mapped_column(Unicode(512), nullable=True)
     target_branch: Mapped[Optional[str]] = mapped_column(Unicode(512), nullable=True)
     pr_web_url: Mapped[Optional[str]] = mapped_column(Unicode(1024), nullable=True)
+    created_by: Mapped[Optional[str]] = mapped_column(Unicode(256), nullable=True)
     event_type: Mapped[Optional[str]] = mapped_column(Unicode(128), nullable=True)
     # Source-branch tip commit reviewed (for the re-review loop-guard).
     source_commit: Mapped[Optional[str]] = mapped_column(Unicode(64), nullable=True)
@@ -182,6 +183,9 @@ class Review(Base):
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     duration_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    current_phase: Mapped[Optional[str]] = mapped_column(Unicode(64), nullable=True)
+    status_message: Mapped[Optional[str]] = mapped_column(Unicode(512), nullable=True)
+    last_activity_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, server_default=func.now()
@@ -200,6 +204,9 @@ class Review(Base):
         back_populates="review",
         cascade="all, delete-orphan",
         order_by="ReviewFinding.round_no, ReviewFinding.role",
+    )
+    events: Mapped[list["ReviewEvent"]] = relationship(
+        back_populates="review", cascade="all, delete-orphan", order_by="ReviewEvent.id"
     )
 
     __table_args__ = (
@@ -267,21 +274,26 @@ class ReviewFinding(Base):
     review_id: Mapped[int] = mapped_column(
         ForeignKey("reviews.id", ondelete="CASCADE"), nullable=False, index=True
     )
-
     role: Mapped[str] = mapped_column(Unicode(16), nullable=False)
-    # 0 is the blind independent pass; 1..N are fight rounds.
     round_no: Mapped[int] = mapped_column(Integer, nullable=False)
     raw: Mapped[str] = mapped_column(UnicodeText, nullable=False)
-
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime, nullable=False, server_default=func.now()
-    )
-
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
     review: Mapped["Review"] = relationship(back_populates="findings")
+    __table_args__ = (CheckConstraint("role IN ('claude','codex')", name="CK_review_findings_role"),)
 
-    __table_args__ = (
-        CheckConstraint(
-            "role IN ('claude','codex')",
-            name="CK_review_findings_role",
-        ),
+
+class ReviewEvent(Base):
+    """Sanitized, append-only progress item for the review detail timeline."""
+
+    __tablename__ = "review_events"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    review_id: Mapped[int] = mapped_column(
+        ForeignKey("reviews.id", ondelete="CASCADE"), nullable=False, index=True
     )
+    kind: Mapped[str] = mapped_column(Unicode(64), nullable=False)
+    phase: Mapped[str] = mapped_column(Unicode(64), nullable=False)
+    message: Mapped[str] = mapped_column(Unicode(512), nullable=False)
+    role: Mapped[Optional[str]] = mapped_column(Unicode(16), nullable=True)
+    round_no: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
+    review: Mapped["Review"] = relationship(back_populates="events")

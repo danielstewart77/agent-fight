@@ -44,6 +44,7 @@ class ReviewJob:
     organization: str
     project: str
     pr_web_url: str = ""
+    created_by: str = ""
     # Tip commit of the source branch at webhook time (resource.lastMergeSource
     # Commit). Used to skip re-reviewing a commit we've already reviewed — the
     # loop-guard against `pullrequest.updated` events fired by our own comment/

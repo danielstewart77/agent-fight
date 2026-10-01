@@ -4,8 +4,8 @@
 `git.pullrequest.created` / `git.pullrequest.updated` event into a `ReviewJob`.
 The side effects are `AdoClient.fetch_pr_context` (read the PR's description and
 every comment thread, including the author's replies to our previous review) and
-`post_or_update_pr_review` / `set_pr_vote` (write the result back), both using
-the stored PAT.
+`post_pr_review` / `set_pr_vote` (write the result back), both using the stored
+PAT. Every review — first or re-review — lands as its own new thread.
 
 ASSUMPTIONS (isolated here — confirm against the target org / a captured live
 payload): the `resource.*` field paths below, that `remoteUrl` is the clone
@@ -33,13 +33,32 @@ SUPPORTED_EVENTS = ("git.pullrequest.created", "git.pullrequest.updated")
 ADO_API_VERSION = "7.1"
 
 # Prepended to every posted review. REVIEW_MARKER is a stable substring of the
-# header used to find our own thread on a re-review so we update it instead of
-# duplicating; keep it stable across header wording changes.
+# header used to recognise our own threads on a PR — to count them (so a
+# re-review is numbered) and to flag them for the reviewers reading the PR
+# context. It must appear verbatim in EVERY header below; keep it stable across
+# header wording changes, since threads posted by older versions still carry it.
 REVIEW_MARKER = "consensus review"
 REVIEW_HEADER = (
     "**Agent🥊🤖🥊Fight - consensus review** — Claude + Codex reviewed this PR "
     "independently and debated to convergence.\n\n"
 )
+
+
+def review_header(revision: int) -> str:
+    """Header for the `revision`-th review of a pull request (1 = the first).
+
+    Every review lands as its OWN new thread, so each one needs a header that
+    says where it sits in the sequence. We used to edit the first review's
+    comment in place, which broke down in practice: the author resolves that
+    comment once they have pushed a fix, and a resolved thread is the last place
+    anyone looks for the next review."""
+    if revision <= 1:
+        return REVIEW_HEADER
+    return (
+        f"**Agent🥊🤖🥊Fight - consensus review (re-review #{revision})** — the PR "
+        "changed, so Claude + Codex reviewed it again independently and debated "
+        "to convergence. This supersedes our earlier review comment(s) here.\n\n"
+    )
 
 
 class UnsupportedEvent(ValueError):
@@ -105,6 +124,8 @@ def parse_pull_request_event(payload: dict, settings: Settings) -> ReviewJob:
     lmsc = resource.get("lastMergeSourceCommit")
     if isinstance(lmsc, dict):
         src_commit = str(lmsc.get("commitId") or "")
+    created_by_obj = resource.get("createdBy") or {}
+    created_by = str(created_by_obj.get("displayName") or created_by_obj.get("uniqueName") or "")
 
     return ReviewJob(
         event_type=event_type,
@@ -119,6 +140,7 @@ def parse_pull_request_event(payload: dict, settings: Settings) -> ReviewJob:
         organization=settings.ado_organization or "",
         project=project,
         pr_web_url=pr_web_url,
+        created_by=created_by,
         source_commit=src_commit,
     )
 
@@ -187,6 +209,19 @@ class AdoClient:
         if resp.status_code // 100 != 2:
             raise RuntimeError(f"ADO {what} failed {resp.status_code}: {resp.text[:300]}")
         return resp.json()
+
+    async def fetch_pull_request(self, settings: Settings, pr_id: int) -> dict:
+        """Fetch the current PR resource used to build a manual-retry job."""
+        if not settings.ado_organization or not settings.ado_project or not settings.ado_pat:
+            raise AdoNotConfigured("Azure DevOps organization, project, and PAT are required")
+        org = quote(settings.ado_organization, safe="")
+        project = quote(settings.ado_project, safe="")
+        return await self._get_json(
+            settings,
+            f"https://dev.azure.com/{org}/{project}/_apis/git/pullrequests/{pr_id}"
+            f"?api-version={ADO_API_VERSION}",
+            "PR detail",
+        )
 
     async def _work_items_section(self, settings: Settings, job: ReviewJob) -> list[str]:
         """Linked work items with title + description, or [] if unavailable.
@@ -304,14 +339,10 @@ class AdoClient:
         lines += rendered or ["_(no comments yet)_"]
         return "\n".join(lines).rstrip() + "\n"
 
-    async def post_pr_review(self, settings: Settings, job: ReviewJob, review_markdown: str) -> None:
-        """Create a new PR thread with the review (with the header/marker)."""
-        if not settings.ado_pat:
-            raise AdoNotConfigured("ado_pat is not configured — set it at /admin/settings")
+    async def _create_review_thread(self, settings: Settings, job: ReviewJob, content: str) -> None:
+        """POST `content` as a new, active comment thread on the PR."""
         body = {
-            "comments": [
-                {"parentCommentId": 0, "content": REVIEW_HEADER + review_markdown, "commentType": 1}
-            ],
+            "comments": [{"parentCommentId": 0, "content": content, "commentType": 1}],
             "status": 1,
         }
         resp = await self._http().post(
@@ -320,37 +351,37 @@ class AdoClient:
         if resp.status_code // 100 != 2:
             raise RuntimeError(f"ADO thread post failed {resp.status_code}: {resp.text[:500]}")
 
-    async def _find_our_thread(self, settings: Settings, job: ReviewJob) -> tuple[int, int] | None:
-        """(thread_id, comment_id) of our prior review thread, by marker, or None."""
+    async def _count_our_threads(self, settings: Settings, job: ReviewJob) -> int:
+        """How many review threads of ours are already on this PR (by marker)."""
         resp = await self._http().get(self._threads_url(job), headers=self._headers(settings))
         if resp.status_code // 100 != 2:
             raise RuntimeError(f"ADO thread list failed {resp.status_code}: {resp.text[:300]}")
-        for thread in resp.json().get("value", []):
-            for comment in thread.get("comments", []):
-                if REVIEW_MARKER in (comment.get("content") or ""):
-                    return thread["id"], comment["id"]
-        return None
+        return sum(
+            1
+            for thread in resp.json().get("value", [])
+            if any(REVIEW_MARKER in (c.get("content") or "") for c in thread.get("comments", []))
+        )
 
-    async def post_or_update_pr_review(
+    async def post_pr_review(
         self, settings: Settings, job: ReviewJob, review_markdown: str
-    ) -> str:
-        """Update our existing review thread if present, else create one.
+    ) -> int:
+        """Post the review as a NEW thread on the PR; returns its revision number.
 
-        Returns "updated" or "created". Keeps a PR to a single, evolving review
-        comment across re-runs rather than a pile of duplicates."""
+        Always a new thread, never an edit of the previous one: the author
+        resolves our comment when they act on it, and a re-review appended to a
+        resolved thread goes unread (and reads as a resolved comment reopening
+        itself). Counting our prior threads is best-effort — if the thread list
+        is unreadable we still post, just unnumbered, rather than lose a review
+        that took several rounds to produce."""
         if not settings.ado_pat:
             raise AdoNotConfigured("ado_pat is not configured — set it at /admin/settings")
-        found = await self._find_our_thread(settings, job)
-        content = REVIEW_HEADER + review_markdown
-        if found is None:
-            await self.post_pr_review(settings, job, review_markdown)
-            return "created"
-        thread_id, comment_id = found
-        url = self._threads_url(job, suffix=f"/{thread_id}/comments/{comment_id}")
-        resp = await self._http().patch(url, headers=self._headers(settings), json={"content": content})
-        if resp.status_code // 100 != 2:
-            raise RuntimeError(f"ADO comment update failed {resp.status_code}: {resp.text[:500]}")
-        return "updated"
+        try:
+            revision = await self._count_our_threads(settings, job) + 1
+        except Exception as exc:  # noqa: BLE001 - numbering is cosmetic, the review is not
+            logger.warning("PR %s: could not count prior review threads: %s", job.pr_id, exc)
+            revision = 1
+        await self._create_review_thread(settings, job, review_header(revision) + review_markdown)
+        return revision
 
     async def _reviewer_id(self, settings: Settings, job: ReviewJob) -> str:
         """The authenticated PAT user's identity id — the reviewer we vote as.

@@ -13,7 +13,7 @@ from sqlalchemy import select
 
 from app.container import FakeHandle, FakeRunner
 from app.orm import Review, ReviewTokenUsage
-from app.runner import ReviewDispatcher, run_and_record
+from app.runner import ReviewDispatcher, describe_review_failure, run_and_record
 from tests.test_coordinator import (
     _indep,
     _seed,
@@ -65,6 +65,7 @@ async def test_run_and_record_persists_success_with_usage(session):
     assert review.rounds_used == 1
     assert review.converged_count == 1
     assert review.final_review_md and "bug" in review.final_review_md
+    assert review.created_by == "Ada Lovelace"
     assert review.finished_at is not None and review.duration_ms is not None
 
     # Usage captured for the prep pass (round 0) AND battle round 1, per harness.
@@ -140,7 +141,28 @@ async def test_run_and_record_marks_failed_on_error(session):
     review = (await session.execute(select(Review))).scalars().one()
     assert review.status == "failed"
     assert "clone exploded" in review.error
+    assert review.status_message.startswith("Source: Review worker")
     assert review.finished_at is not None
+
+
+@pytest.mark.parametrize("exc,expected", [
+    (TimeoutError(), "Source: Review worker"),
+    (RuntimeError("fatal: couldn't find remote ref refs/heads/gone"), "Source: Repository checkout"),
+])
+def test_describe_review_failure_for_infrastructure_errors(exc, expected):
+    message = describe_review_failure(exc)
+    assert expected in message
+    assert "What happened:" in message and "Next step:" in message
+
+
+def test_describe_review_failure_for_agent_timeout():
+    from app.review.models import ReviewFailure
+    exc = ReviewFailure("claude inactive", harness="claude", round_no=1, reason="inactive")
+    message = describe_review_failure(exc)
+    assert "Source: Claude review agent" in message
+    assert "fight round 1" in message
+    assert "produced no output for 30 minutes" in message
+    assert "model connection may be stalled" in message
 
 
 async def test_run_and_record_harness_failure_never_posts_but_records(session):

@@ -67,9 +67,9 @@ _STDERR_EXCERPT = 2000
 
 logger = logging.getLogger("agent_fight.coordinator")
 
-# Per-harness wall-clock cap for a single review round (a hung CLI must not
-# block the run forever).
-HARNESS_TIMEOUT = 900.0
+# A harness may run as long as needed while it is producing output. Kill only
+# after this much complete stdout/stderr silence.
+HARNESS_INACTIVITY_TIMEOUT = 1800.0
 
 # How much of the diff to inline in the round-0 prompt. Past this the prompt
 # points at DIFF_PATH instead — the whole diff is always on disk in the
@@ -677,6 +677,7 @@ async def run_review(
     harnesses: Optional[list[HarnessType]] = None,
     judge: Optional[Judge] = None,
     post_back: bool = True,
+    progress=None,
 ) -> ReviewOutcome:
     """Run the full review for one PR and return a `ReviewOutcome`.
 
@@ -702,6 +703,10 @@ async def run_review(
     round_cap = max(1, int(settings.round_cap))
     h1, h2 = harnesses
 
+    async def emit(kind, phase, message, *, role=None, round_no=None):
+        if progress is not None:
+            await progress(kind, phase, message, role=role, round_no=round_no)
+
     usage_records: list[RoleRoundUsage] = []
     raw_records: list[RawFindings] = []
     rounds_used = 0
@@ -716,9 +721,18 @@ async def run_review(
         """Run one harness, capture usage, and fail-closed on any fault."""
         argv = build_argv(h, workdir=WORKDIR, model=harness_model(h, settings))
         env = {**harness_env(h, settings), **ado_env(job, settings)}
-        exec_res = await handle.exec(
-            argv, env=env, stdin=prompt, timeout=HARNESS_TIMEOUT
-        )
+        try:
+            exec_res = await handle.exec(
+                argv, env=env, stdin=prompt, timeout=HARNESS_INACTIVITY_TIMEOUT
+            )
+        except TimeoutError:
+            # Do not automatically repeat a long, expensive review. The failed
+            # run is recorded and an operator can decide whether to retry it.
+            raise ReviewFailure(
+                f"harness {h.value} produced no output for {HARNESS_INACTIVITY_TIMEOUT / 60:g} minutes in {phase}",
+                harness=h.value, round_no=round_no, reason="inactive",
+                usage=list(usage_records),
+            ) from None
         # Capture usage even on failure so a failed run still accounts for spend.
         h_usage = extract_usage(h, exec_res.stdout)
         if not h_usage.is_empty:
@@ -735,6 +749,7 @@ async def run_review(
         )
 
     async with runner.start(job) as handle:
+        await emit("phase_started", "preparing_repository", "Preparing repository")
         await prepare_repo(
             handle,
             job,
@@ -743,6 +758,7 @@ async def run_review(
         )
         await provision_harnesses(handle, settings)
         diff = await compute_diff(handle, job)
+        await emit("phase_completed", "preparing_repository", "Repository prepared")
         if not diff.strip():
             # Not a failure (the branch may genuinely add nothing), but log it —
             # an empty diff is also the fingerprint of a bad ref/checkout.
@@ -761,19 +777,23 @@ async def run_review(
         # Both agents review blind. This builds the prerequisites for a fight; it
         # is not a fight round and no judgment runs yet.
         logger.info("PR %s: independent review (both agents, blind)", job.pr_id)
+        await emit("phase_started", "independent_review", "Independent review started")
         for h in harnesses:
+            await emit("agent_started", "independent_review", f"{h.value.title()} reviewing", role=h.value, round_no=0)
             fpath = _independent_path(h)
             prev[h] = await _run_harness(
                 h,
                 build_independent_prompt(job, diff, fpath, round_cap=round_cap),
                 fpath, round_no=0, phase="independent review",
             )
+            await emit("agent_completed", "independent_review", f"{h.value.title()} completed with {len(prev[h])} finding(s)", role=h.value, round_no=0)
 
         # ---- Fight rounds --------------------------------------------------- #
         decision: Optional[CoordinatorDecision] = None
         result = convergence(prev[h1], prev[h2])
         for round_no in range(1, round_cap + 1):
             rounds_used = round_no
+            await emit("round_started", "fight", f"Fight round {round_no} started", round_no=round_no)
             # Snapshot before either agent runs, so both fight the same opponent
             # state. Reading `prev` live would hand the second agent the first
             # agent's brand-new findings while the first saw only last round's —
@@ -799,6 +819,7 @@ async def run_review(
                 prev[h] = await _run_harness(
                     h, prompt, fpath, round_no=round_no, phase=f"round {round_no}"
                 )
+                await emit("agent_completed", "fight", f"{h.value.title()} completed round {round_no} with {len(prev[h])} finding(s)", role=h.value, round_no=round_no)
 
             # The agents' own marks decide what the review says; the judge only
             # decides whether the fight is over (and what to vote).
@@ -816,6 +837,7 @@ async def run_review(
                 decision.converged, decision.summary or "no reason given",
             )
             if decision.converged:
+                await emit("round_completed", "fight", f"Round {round_no} converged", round_no=round_no)
                 logger.info("PR %s converged after round %s", job.pr_id, round_no)
                 break
 
@@ -844,7 +866,8 @@ async def run_review(
             "PR %s posting review: status=%s rounds=%s agreed=%s disagreed=%s vote=%s(%s)",
             job.pr_id, status, rounds_used, len(agreed), len(disagreed), vote, vote_label(vote),
         )
-        await ado_client.post_or_update_pr_review(settings, job, review_md)
+        revision = await ado_client.post_pr_review(settings, job, review_md)
+        logger.info("PR %s review posted as a new thread (revision %s)", job.pr_id, revision)
         # Voting is best-effort: a failed/rejected vote (e.g. on a completed PR)
         # must not fail an otherwise-successful review.
         try:

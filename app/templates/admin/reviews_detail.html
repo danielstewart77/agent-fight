@@ -14,13 +14,55 @@
     white-space: pre-wrap; word-wrap: break-word; margin: 0;
     font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
   }
+  .review-html { line-height: 1.6; overflow-wrap: anywhere; }
+  .review-html > :first-child { margin-top: 0; }
+  .review-html > :last-child { margin-bottom: 0; }
+  .review-html pre { overflow-x: auto; padding: 12px; border-radius: 6px; background: var(--bg); }
+  .review-html code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .review-html blockquote { margin-left: 0; padding-left: 14px; border-left: 3px solid var(--border); color: var(--muted); }
   dl.meta { display: grid; grid-template-columns: max-content 1fr; gap: 6px 20px; margin: 0; }
   dl.meta dt { color: var(--muted); }
   dl.meta dd { margin: 0; }
+  .failure-summary { white-space: pre-line; line-height: 1.6; }
+  details.failure-details { margin-top: 14px; }
+  details.failure-details summary { cursor: pointer; color: var(--muted); }
+  .agent-thread { display: flex; flex-direction: column; gap: 16px; margin-top: 22px; }
+  .round-divider { display: flex; align-items: center; gap: 12px; color: var(--muted); font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; }
+  .round-divider::before, .round-divider::after { content: ""; height: 1px; background: var(--border); flex: 1; }
+  .agent-message { display: flex; align-items: flex-start; gap: 10px; max-width: 88%; }
+  .agent-message.codex { align-self: flex-end; flex-direction: row-reverse; }
+  .agent-avatar { display: grid; place-items: center; flex: 0 0 34px; height: 34px; border-radius: 50%; color: white; font-weight: 700; font-size: 13px; background: #b36b23; }
+  .agent-message.codex .agent-avatar { background: #397d6b; }
+  .agent-content { min-width: 0; }
+  .agent-byline { margin: 0 4px 5px; color: var(--muted); font-size: 12px; }
+  .agent-message.codex .agent-byline { text-align: right; }
+  .agent-bubble { padding: 14px; border: 1px solid var(--border); border-radius: 4px 14px 14px 14px; background: color-mix(in srgb, var(--card) 88%, #b36b23 12%); }
+  .agent-message.codex .agent-bubble { border-radius: 14px 4px 14px 14px; background: color-mix(in srgb, var(--card) 88%, #397d6b 12%); }
+  .agent-empty { margin: 0; color: var(--muted); font-style: italic; }
+  .finding-card + .finding-card { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border); }
+  .finding-head { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin-bottom: 8px; }
+  .finding-location { font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
+  .finding-pill { padding: 1px 7px; border: 1px solid var(--border); border-radius: 999px; color: var(--muted); font-size: 11px; text-transform: uppercase; }
+  .finding-pill.critical, .finding-pill.high, .finding-pill.major { color: var(--danger); }
+  .finding-pill.agree, .finding-pill.resolved { color: var(--ok); }
+  .finding-pill.disagree { color: var(--warn); }
+  .finding-claim { margin: 0; white-space: pre-wrap; }
+  .finding-detail { margin-top: 10px; font-size: 13px; }
+  .finding-detail strong { display: block; margin-bottom: 2px; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+  .finding-detail p { margin: 0; white-space: pre-wrap; }
+  .agent-raw { max-height: 320px; overflow: auto; }
+  @media (max-width: 700px) { .agent-message { max-width: 100%; } }
 </style>
 {% set sc = {'converged':'ok','capped':'warn','failed':'danger','running':'muted'} %}
 
 <p class="muted"><a href="/admin/reviews">← Reviews</a></p>
+{% set retry = request.query_params.get('retry') %}
+{% if retry == 'queued' %}<div class="card ok">Retry queued using the pull request's latest commit.</div>{% endif %}
+{% if retry == 'already-running' %}<div class="card warn">This pull request already has a review running.</div>{% endif %}
+{% if retry == 'completed' %}<div class="card warn">This pull request is no longer active and was not retried.</div>{% endif %}
+{% if retry == 'lookup-failed' %}<div class="card error">Could not read the current pull request from Azure DevOps. Check the connection settings and try again.</div>{% endif %}
+{% if retry == 'not-configured' %}<div class="card error">Azure DevOps is not configured, so the review could not be retried.</div>{% endif %}
+{% if retry == 'not-failed' %}<div class="card warn">Only failed reviews can be retried.</div>{% endif %}
 <h1>PR #{{ r.pr_id }} — {{ r.repo_name }}
   <span class="badge {{ sc.get(r.status, 'muted') }}">{{ r.status }}</span></h1>
 
@@ -28,6 +70,7 @@
   <dl class="meta">
     <dt>Pull request</dt>
     <dd>{% if r.pr_web_url %}<a href="{{ r.pr_web_url }}">{{ r.pr_web_url }}</a>{% else %}#{{ r.pr_id }}{% endif %}</dd>
+    <dt>Created by</dt><dd>{{ r.created_by or '—' }}</dd>
     <dt>Branches</dt><dd><code>{{ r.source_branch }}</code> → <code>{{ r.target_branch }}</code></dd>
     <dt>Project</dt><dd>{{ r.organization or '—' }} / {{ r.project or '—' }}</dd>
     <dt>Rounds used</dt><dd>{{ r.rounds_used }}</dd>
@@ -37,10 +80,27 @@
   </dl>
 </div>
 
+<div class="card" id="progress-card">
+  <h2>Progress</h2>
+  <p id="progress-now"><strong>{{ r.status_message or r.current_phase or r.status }}</strong>
+    {% if r.last_activity_at %}<span class="muted"> · last activity {{ r.last_activity_at.strftime('%H:%M:%S') }}</span>{% endif %}</p>
+  <ol id="progress-events">
+    {% for e in events %}<li data-event-id="{{ e.id }}"><span class="muted">{{ e.created_at.strftime('%H:%M:%S') }}</span> {{ e.message }}</li>{% endfor %}
+  </ol>
+</div>
+
 {% if r.error %}
 <div class="card">
-  <h2 style="color: var(--danger)">Failure</h2>
-  <pre class="review error">{{ r.error }}</pre>
+  <h2 style="color: var(--danger)">Review failed</h2>
+  <div class="failure-summary">{{ r.status_message or 'The review stopped unexpectedly.' }}</div>
+  <p><strong>Result:</strong> Nothing was posted to the pull request.</p>
+  <form method="post" action="/admin/reviews/{{ r.id }}/retry" onsubmit="this.querySelector('button').disabled=true">
+    <button type="submit">Retry review</button>
+  </form>
+  <details class="failure-details">
+    <summary>Technical details</summary>
+    <pre class="review error">{{ r.error }}</pre>
+  </details>
 </div>
 {% endif %}
 
@@ -82,7 +142,7 @@
 <div class="card">
   <h2>Posted review</h2>
   {% if r.final_review_md %}
-  <pre class="review">{{ r.final_review_md }}</pre>
+  <div class="review-html">{{ r.final_review_md | markdown }}</div>
   {% else %}
   <p class="muted">Nothing was posted (run did not complete).</p>
   {% endif %}
@@ -95,13 +155,62 @@
     blind independent review, 1+ are fight rounds. This is the source the posted
     comment above was built from.
   </p>
-  {% if not findings %}
+  {% if not finding_messages %}
   <p class="muted">No findings files recorded for this run.</p>
   {% else %}
-  {% for f in findings %}
-  <h3>{{ f.role }} — round {{ f.round_no }}</h3>
-  <pre class="review">{{ f.raw }}</pre>
-  {% endfor %}
+  <div class="agent-thread">
+    {% for message in finding_messages %}
+      {% if loop.first or message.round_no != finding_messages[loop.index0 - 1].round_no %}
+      <div class="round-divider">
+        {% if message.round_no == 0 %}Independent review{% else %}Fight round {{ message.round_no }}{% endif %}
+      </div>
+      {% endif %}
+      <article class="agent-message {{ message.role }}">
+        <div class="agent-avatar" aria-hidden="true">{{ 'CL' if message.role == 'claude' else 'CX' }}</div>
+        <div class="agent-content">
+          <div class="agent-byline"><strong>{{ message.role | title }}</strong></div>
+          <div class="agent-bubble">
+            {% if message.fallback is not none %}
+            <p class="muted">This agent returned an unstructured response:</p>
+            <pre class="review agent-raw">{{ message.fallback }}</pre>
+            {% elif not message['items'] %}
+            <p class="agent-empty">No findings in this round.</p>
+            {% else %}
+              {% for item in message['items'] %}
+              <div class="finding-card">
+                <div class="finding-head">
+                  <span class="finding-location">{{ item.get('file', 'Unknown file') }}{% if item.get('line') %}:{{ item.line }}{% endif %}</span>
+                  {% if item.get('severity') %}<span class="finding-pill {{ item.severity | lower }}">{{ item.severity }}</span>{% endif %}
+                  {% if item.get('verdict') %}<span class="finding-pill {{ item.verdict | lower }}">{{ item.verdict }}</span>{% endif %}
+                </div>
+                <p class="finding-claim">{{ item.get('claim', 'No claim supplied.') }}</p>
+                {% for key, label in [('response', 'Response'), ('evidence', 'Evidence'), ('suggestion', 'Suggested fix')] %}
+                  {% if item.get(key) %}<div class="finding-detail"><strong>{{ label }}</strong><p>{{ item.get(key) }}</p></div>{% endif %}
+                {% endfor %}
+              </div>
+              {% endfor %}
+            {% endif %}
+          </div>
+        </div>
+      </article>
+    {% endfor %}
+  </div>
   {% endif %}
 </div>
+{% endblock %}
+{% block scripts %}
+{% if r.status == 'running' %}
+<script>
+(() => {
+  const list = document.getElementById('progress-events');
+  const now = document.getElementById('progress-now');
+  let last = Number(list.lastElementChild?.dataset.eventId || 0);
+  const add = e => { if (e.id <= last) return; last=e.id; const li=document.createElement('li'); li.dataset.eventId=e.id; li.textContent=`${new Date(e.created_at).toLocaleTimeString()} ${e.message}`; list.appendChild(li); now.firstElementChild.textContent=e.message; };
+  const source = new EventSource(`/admin/reviews/{{ r.id }}/events`);
+  source.onmessage = x => add(JSON.parse(x.data));
+  source.addEventListener('done', () => location.reload());
+  source.onerror = () => { source.close(); setInterval(async()=>{ const d=await fetch(`/admin/reviews/{{ r.id }}/progress?after=${last}`).then(r=>r.json()); d.events.forEach(add); if(d.status!=='running') location.reload(); },5000); };
+})();
+</script>
+{% endif %}
 {% endblock %}

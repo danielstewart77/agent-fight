@@ -28,9 +28,62 @@ from typing import Awaitable, Callable, Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.review.models import ReviewJob
+from app.review.models import ReviewFailure, ReviewJob
 
 logger = logging.getLogger("agent_fight.runner")
+
+
+def describe_review_failure(exc: Exception) -> str:
+    """Turn an internal exception into a safe, actionable operator message.
+
+    The full traceback is still stored in ``Review.error``.  This text is the
+    deliberately short explanation shown first in the admin UI.
+    """
+    raw = str(exc)
+    text = raw.lower()
+    source = "Review worker"
+    happened = "The review stopped because of an unexpected internal error."
+    action = "Open technical details below, then retry after correcting the reported cause."
+
+    if isinstance(exc, ReviewFailure):
+        source = f"{exc.harness.title()} review agent" if exc.harness else "Review coordinator"
+        stage = "independent review" if exc.round_no == 0 else (
+            f"fight round {exc.round_no}" if exc.round_no is not None else "review"
+        )
+        if exc.reason == "inactive":
+            happened = f"The {source} produced no output for 30 minutes during {stage}."
+            action = "The agent or model connection may be stalled. Check the model service before retrying."
+        elif "upstream connection dropped" in text or "connection reset" in text or "connection closed" in text:
+            happened = f"The model service connection for the {source} dropped during {stage}, including its retry."
+            action = "This is usually transient. Check the model proxy/upstream status, then retry the review."
+        elif any(marker in text for marker in ("401", "403", "unauthorized", "forbidden", "authentication")):
+            happened = f"The {source} was rejected by its model service during {stage}."
+            action = "Verify that agent's proxy URL, API key, and model access in Settings, then retry."
+        elif exc.reason == "wrote no findings file":
+            happened = f"The {source} exited without producing its required findings file during {stage}."
+            action = "Check the agent logs and review image/skill compatibility, then retry."
+        elif exc.reason and "unparseable" in exc.reason:
+            happened = f"The {source} produced malformed findings during {stage}; nothing was posted."
+            action = "Check the agent output in technical details and verify the review skill, then retry."
+        elif exc.reason == "judge call failed":
+            happened = f"The coordinator model could not judge {stage}; nothing was posted."
+            action = "Check the coordinator proxy, key, and model configuration, then retry."
+        else:
+            happened = f"The {source} failed during {stage}; nothing was posted."
+    elif isinstance(exc, TimeoutError):
+        source = "Review worker"
+        happened = "A review operation exceeded its time limit."
+        action = "Retry the review. If it repeats, inspect technical details to identify the slow operation."
+    elif any(marker in text for marker in ("couldn't find remote ref", "not our ref", "reference is not a tree")):
+        source = "Repository checkout"
+        happened = "Azure DevOps no longer exposes the source branch or commit from this webhook event."
+        action = "Push or restore the source commit and trigger a new PR update; an old event cannot be reviewed."
+    elif "repo prep step" in text or "git clone" in text or "git fetch" in text:
+        source = "Repository checkout"
+        happened = "The repository could not be cloned or prepared for review."
+        action = "Check the clone credential, repository access, and ref shown in technical details, then retry."
+
+    return f"Source: {source}\nWhat happened: {happened}\nNext step: {action}"
 
 
 def _utcnow() -> datetime:
@@ -142,7 +195,7 @@ async def run_and_record(
     exercisable against `FakeRunner` without Docker or a live proxy.
     """
     from app.coordinator import run_review
-    from app.orm import Review, ReviewFinding, ReviewTokenUsage
+    from app.orm import Review, ReviewEvent, ReviewFinding, ReviewTokenUsage
 
     review = Review(
         pr_id=job.pr_id,
@@ -152,14 +205,25 @@ async def run_and_record(
         source_branch=job.source_branch,
         target_branch=job.target_branch,
         pr_web_url=job.pr_web_url or None,
+        created_by=job.created_by or None,
         event_type=job.event_type,
         source_commit=job.source_commit or None,
         status="running",
+        current_phase="queued",
+        status_message="Review accepted",
+        last_activity_at=_utcnow(),
         started_at=_utcnow(),
     )
     session.add(review)
     await session.commit()
     await session.refresh(review)
+
+    async def progress(kind, phase, message, *, role=None, round_no=None):
+        now = _utcnow()
+        review.current_phase, review.status_message, review.last_activity_at = phase, message, now
+        session.add(ReviewEvent(review_id=review.id, kind=kind, phase=phase,
+                                message=message, role=role, round_no=round_no, created_at=now))
+        await session.commit()
 
     def _persist_usage(records) -> None:
         for rr in records:
@@ -179,13 +243,16 @@ async def run_and_record(
     started = time.monotonic()
     try:
         outcome = await run_review(
-            job, settings, runner=runner, ado_client=ado_client, judge=judge,
+            job, settings, runner=runner, ado_client=ado_client, judge=judge, progress=progress,
         )
     except Exception as exc:  # noqa: BLE001 - record failure, DO NOT post, re-raise to log
         # A failed run is recorded as `failed` and NOTHING is posted to the PR
         # (run_review raises before its post-back). This is the guarantee that a
         # broken review can never look successful. See coordinator.ReviewFailure.
         review.status = "failed"
+        review.current_phase = "failed"
+        review.status_message = describe_review_failure(exc)[:512]
+        review.last_activity_at = _utcnow()
         review.error = traceback.format_exc()
         review.finished_at = _utcnow()
         review.duration_ms = int((time.monotonic() - started) * 1000)
@@ -198,6 +265,9 @@ async def run_and_record(
         raise
 
     review.status = outcome.status
+    review.current_phase = "completed"
+    review.status_message = "Review completed"
+    review.last_activity_at = _utcnow()
     review.rounds_used = outcome.rounds_used
     review.converged_count = outcome.converged_count
     review.disagreement_count = outcome.disagreement_count

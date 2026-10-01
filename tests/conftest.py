@@ -108,6 +108,7 @@ def sample_ado_payload(event_type: str = "git.pullrequest.created") -> dict:
         "eventType": event_type,
         "resource": {
             "pullRequestId": 42,
+            "createdBy": {"displayName": "Ada Lovelace", "uniqueName": "ada@example.com"},
             "sourceRefName": "refs/heads/feature-x",
             "targetRefName": "refs/heads/main",
             "repository": {
