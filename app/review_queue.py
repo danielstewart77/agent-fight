@@ -38,10 +38,12 @@ class ReviewDispatcher:
         self._preparing: dict[int, asyncio.Task] = {}
         self._running: dict[int, asyncio.Task] = {}
         self._loop_task = None
+        self._stop_polling = asyncio.Event()
 
     async def start(self):
         if self._loop_task is not None:
             raise RuntimeError("review worker already started")
+        self._stop_polling.clear()
         async with self._sessions() as session:
             await session.execute(update(ReviewRequest).where(
                 ReviewRequest.status == "running").values(status="interrupted"))
@@ -54,7 +56,8 @@ class ReviewDispatcher:
 
     async def stop(self):
         if self._loop_task:
-            self._loop_task.cancel()
+            # Let an in-flight SQLite poll close its session before shutting down.
+            self._stop_polling.set()
             await asyncio.gather(self._loop_task, return_exceptions=True)
             self._loop_task = None
         tasks = [*self._preparing.values(), *self._running.values()]
@@ -65,12 +68,15 @@ class ReviewDispatcher:
         self._running.clear()
 
     async def _loop(self):
-        while True:
+        while not self._stop_polling.is_set():
             try:
                 await self.tick()
             except Exception:
                 logger.exception("review inbox poll failed")
-            await asyncio.sleep(self._poll_seconds)
+            try:
+                await asyncio.wait_for(self._stop_polling.wait(), self._poll_seconds)
+            except asyncio.TimeoutError:
+                pass
 
     def _spawn(self, tasks, request_id, coroutine):
         task = asyncio.create_task(coroutine)
