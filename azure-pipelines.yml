@@ -1,0 +1,57 @@
+# Manual bootstrap deployment for the new webhook VM.
+# This proves artifact delivery to the dedicated target agent without starting
+# the application or changing the existing Agent Fight service hook.
+trigger: none
+pr: none
+
+name: ulmwebhooks_$(Date:yyyyMMdd).$(Rev:r)
+
+stages:
+  - stage: Package
+    displayName: Package deployment probe
+    jobs:
+      - job: Package
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+          - bash: |
+              set -euo pipefail
+              printf '%s\n' "$SOURCE_VERSION" > "$BUILD_ARTIFACTSTAGINGDIRECTORY/commit.txt"
+              test -s "$BUILD_ARTIFACTSTAGINGDIRECTORY/commit.txt"
+            displayName: Record source commit
+            env:
+              SOURCE_VERSION: $(Build.SourceVersion)
+          - publish: $(Build.ArtifactStagingDirectory)/commit.txt
+            artifact: deployment-probe
+
+  - stage: DeployToUlmwebhooks
+    displayName: Deploy probe to ulmwebhooks
+    dependsOn: Package
+    condition: succeeded()
+    jobs:
+      - job: DeployProbe
+        pool:
+          name: ULM-Webhooks
+          demands:
+            - Agent.Name -equals ulmwebhooks
+        steps:
+          - checkout: none
+          - download: current
+            artifact: deployment-probe
+          - bash: |
+              set -euo pipefail
+              case "$(hostname -s)" in
+                ulmhooks|ulmwebhooks) ;;
+                *) echo 'Unexpected deployment host' >&2; exit 1 ;;
+              esac
+              ip -o -4 address show | grep -q 'inet 10.200.100.107/'
+
+              source_file="$PIPELINE_WORKSPACE/deployment-probe/commit.txt"
+              release_dir="$HOME/agent-fight-deployments/probes/$BUILD_BUILDID"
+              install -d -m 0750 "$release_dir"
+              install -m 0640 "$source_file" "$release_dir/commit.txt"
+              cmp "$source_file" "$release_dir/commit.txt"
+              printf 'Deployed source commit %s to %s on %s\n' \
+                "$(cat "$release_dir/commit.txt")" "$release_dir" "$(hostname -s)"
+            displayName: Install and verify deployment probe
