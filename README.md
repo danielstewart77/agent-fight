@@ -121,32 +121,32 @@ The review pipeline consists of:
 
 ### The fight
 
-Round 0 is a blind independent review: each harness gets the repo checked out at
-the PR branch, `/work/pr.diff`, `/work/pr-context.md`, and a live PR API
-endpoint, and writes structured findings.
+Round 0 runs Claude and Codex independently **in parallel**, using the pinned
+checkout, diff, PR context and configured models. Valid empty reviews from both
+agents finish immediately. Failed or malformed outputs never count as clean.
 
-Rounds 1..N are the fight. Each harness runs again **in the same container, with
-the same checkout**, and is handed its own findings plus the rival's *verbatim*
-and every item still open. Nothing summarizes a rival's argument on the way
-across. The instruction is to go back to the code and settle it — agree,
-disagree with the code that refutes it, revise, or withdraw — marking every item
-`agree` / `disagree` / `revised` / `resolved`. Both fighters see the same
-opponent state (snapshotted at the top of the round), so neither gets a
-first-mover advantage.
+Round 1 runs both cross-reviews **in parallel** against the same immutable
+round-0 snapshot. The coordinator assigns stable finding IDs and original
+owners. Each reviewer explicitly responds to the other's findings.
 
-After each round a judge rules on one question: is the fight over? It sees both
-findings files and **no code**; it never writes, merges, or rewords a finding.
-Converged means nothing is left where one reviewer asserts a defect and the
-other rejects or ignores it. It also casts the reviewer vote. The review's
-content is the agents' own text, diffed by `convergence` into agreed / disputed
-/ one-sided, with both sides of a dispute quoted in full.
+Rounds 2 and later run **only the agent that owes the next response**. If Claude
+challenges a Codex finding, Codex either withdraws it or defends/revises it. A
+withdrawal closes that authored claim. A defense goes back to Claude for
+acceptance or continued objection. Reciprocal obligations run concurrently,
+batched by reviewer. Later prompts include only assigned open items; settled
+findings stay in the coordinator's ledger.
 
-Findings carry `evidence` (the code the reviewer actually read) rather than a
-self-scored confidence. A claim about runtime behavior that crosses layers needs
-the code at every hop; the rival's job is to attack anything that doesn't have
-it. On a re-review, the author's replies to the previous review arrive in
-`/work/pr-context.md` — a finding the author already refuted must not come back
-without code that answers them.
+Completion and reviewer votes come from explicit ledger state, with no LLM judge
+call. A revision of a claim or severity requires acknowledgment. Missing replies
+remain open. The round cap is a maximum, not a requirement to run every round;
+`3` permits independent round 0 and fight rounds 1, 2, 3. At the cap, surviving
+concerns and both arguments of unresolved disputes are posted without a tiebreak.
+The saved coordinator proxy connection remains available for legacy diagnostics;
+it is not used by this loop.
+
+Findings retain evidence, fixes and per-round raw JSON. An author's replies to
+previous reviews arrive in the PR context. Agents must verify arguments against
+the code, and must not re-raise a refuted finding without answering that evidence.
 
 **Not exercised in this environment.** The Docker driver, the real harness
 CLIs, the live proxy, and real ADO payloads/REST calls cannot run here, so the

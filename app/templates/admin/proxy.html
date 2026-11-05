@@ -2,9 +2,10 @@
 {% block title %}Proxy — Agent Fight{% endblock %}
 {% block content %}
 <h1>Inference proxy</h1>
-<p>Each harness and the coordinator connects to the proxy independently, and
+<p>The Claude and Codex harnesses connect to the proxy independently, and
    each is registered in two steps (the model list can only be fetched once the
    proxy has a key):</p>
+<p>Review completion now follows explicit responses. The saved coordinator connection is retained for diagnostics and is not called during reviews.</p>
 <ol style="color:var(--muted);">
   <li><strong>Step 1</strong> — enter the base URL and API key, then <strong>Save</strong>.</li>
   <li><strong>Step 2</strong> — the page reloads with the models that key can

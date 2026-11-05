@@ -28,3 +28,7 @@ docker-compose.override.yml
 
 # SQLite database
 data/
+# Local evidence from private PRs; never publish it with the source branch.
+plans/directed-review/baseline-*.json
+plans/directed-review/replay-results/
+plans/directed-review/*.log

@@ -57,7 +57,7 @@ async def test_run_and_record_persists_success_with_usage(session):
 
     review = await run_and_record(
         session, _job(), _settings(round_cap=3),
-        runner=FakeRunner(handle), ado_client=ado, judge=None,
+        runner=FakeRunner(handle), ado_client=ado,
     )
 
     # Row finalized to converged with metrics (battle rounds only; prep uncounted).
@@ -177,7 +177,7 @@ async def test_run_and_record_persists_every_agents_raw_findings(session):
     )
     review = await run_and_record(
         session, _job(), _settings(round_cap=3),
-        runner=FakeRunner(handle), ado_client=_RecordingAdo(), judge=None,
+        runner=FakeRunner(handle), ado_client=_RecordingAdo(),
     )
 
     rows = (

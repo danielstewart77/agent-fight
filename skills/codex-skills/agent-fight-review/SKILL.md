@@ -30,8 +30,8 @@ A JSON list of objects, each:
 Rules:
 
 - `line` is 1-indexed and must point at the real location of the issue. 0 means
-  file-level. In a fight round, keep the rival's **exact** file and line when
-  responding to their item — that anchor is how the two reviews are matched.
+  file-level. In a fight round, return the supplied `finding_id` unchanged.
+  It identifies the finding even when its anchor or claim is revised.
 - `claim` states the defect and its concrete impact: the failing input or state
   and the resulting wrong behavior.
 - `evidence` is what you actually opened and read. A claim about runtime
@@ -43,7 +43,16 @@ Rules:
   `revised`, or `resolved`, and `response` carries your argument — why you
   agree, or the code that proves the rival wrong. Change your mind when they are
   right; hold your ground with evidence when they are not.
-- An empty list `[]` is a valid answer: the change is clean.
+- Rounds 0 and 1 run in parallel. In rounds 2+, answer only the assigned open
+  items. The coordinator preserves settled findings. An author uses `issue` to
+  defend a challenged claim or `resolved` to withdraw it; a challenger uses
+  `agree` to accept a defense or `disagree` to maintain the objection.
+- `agree` accepts the supplied claim and severity. Use `revised` to propose a
+  materially changed claim or severity; the other reviewer must accept it.
+- If withdrawing your duplicate, use `resolved` and `duplicate_of` with the
+  surviving finding ID. Do not merge distinct defects just because lines match.
+- An empty list `[]` is valid in round 0. In later rounds it leaves assigned
+  responses unanswered; it is not agreement or evidence that the PR is clean.
 - Write **only** the JSON file. That file is the source of truth; anything you
   print to stdout is ignored.
 

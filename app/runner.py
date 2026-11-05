@@ -107,12 +107,6 @@ async def _default_run(job: ReviewJob) -> None:
 
         from app import skills as skills_mod
 
-        judge = _proxy_judge(settings)
-        if judge is None:
-            logger.warning(
-                "PR %s: coordinator LLM (coord proxy) not configured — falling "
-                "back to the deterministic diff for convergence", job.pr_id,
-            )
         ado_client = AdoClient()
         mounts = skills_mod.selected_skill_mounts(settings)
         try:
@@ -122,7 +116,6 @@ async def _default_run(job: ReviewJob) -> None:
                 settings,
                 runner=DockerRunner(config.review_image, mounts=mounts),
                 ado_client=ado_client,
-                judge=judge,
             )
         finally:
             await ado_client.aclose()
@@ -135,7 +128,6 @@ async def run_and_record(
     *,
     runner,
     ado_client,
-    judge=None,
 ):
     """Run one review to completion and persist it as a `Review` row.
 
@@ -146,7 +138,7 @@ async def run_and_record(
     (the dispatcher's guard still logs it). This is what makes a failed run
     visible without shelling into the process log.
 
-    `runner`/`ado_client`/`judge` are injected so the whole lifecycle is
+    `runner`/`ado_client` are injected so the whole lifecycle is
     exercisable against `FakeRunner` without Docker or a live proxy.
     """
     from app.coordinator import run_review
@@ -198,9 +190,13 @@ async def run_and_record(
     started = time.monotonic()
     try:
         outcome = await run_review(
-            job, settings, runner=runner, ado_client=ado_client, judge=judge, progress=progress,
+            job, settings, runner=runner, ado_client=ado_client, progress=progress,
         )
     except (Exception, asyncio.CancelledError) as exc:  # record interrupted runs as well
+        # Cancellation can interrupt the other agent's progress-event commit.
+        # Recover the session before persisting the failed review and its usage.
+        await session.rollback()
+        await session.refresh(review)
         # A failed run is recorded as `failed` and NOTHING is posted to the PR
         # (run_review raises before its post-back). This is the guarantee that a
         # broken review can never look successful. See coordinator.ReviewFailure.

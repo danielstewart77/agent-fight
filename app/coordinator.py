@@ -1,29 +1,14 @@
-"""The fight loop: independent review, then rounds of argument over the code.
+"""Parallel independent/cross reviews followed by directed response batches.
 
-  Round 0    — each harness reviews the diff blind, with the full repo and the
-               pull request in front of it, and writes its own findings file.
-  Round 1..N — each harness is handed its own findings, the rival's findings
-               VERBATIM, and every item still open, and is told to go back to
-               the code and settle it: agree, disagree with proof, revise, or
-               withdraw. Same container, same checkout — a fight round is a full
-               re-review, not a vote on someone else's summary.
-  Each round — the two latest findings files are diffed item by item (same file,
-               same line) into agreed / disputed / unanswered, and a judge rules
-               on whether the fight is over.
-  Terminate  — converged, or the configurable round cap. No tiebreak: the final
-               review is the union of every agreed item, every unresolved
-               dispute (both sides quoted), and every one-sided concern.
-
-The judge referees; it does not review. It never sees the code and never
-rewrites a finding — what the agents wrote is what the pull request gets.
-
-The pure functions (`parse_findings`, `convergence`, `build_independent_prompt`,
-`build_fight_prompt`, `synthesize_final_review`) hold the logic and are fully
-unit-testable; only `run_review` touches the container.
+A coordinator-owned FindingLedger keeps stable identities, original owners,
+settled findings, and the next responder for each open item. Only pending agents
+run after round 1. Completion and voting are deterministic; legacy convergence
+and judge parsers remain available for historical integrations.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Awaitable, Callable, Optional, Union
@@ -135,6 +120,8 @@ def parse_findings(raw: str) -> list[Finding]:
                 suggestion=str(item.get("suggestion", "") or ""),
                 evidence=str(item.get("evidence", "") or ""),
                 response=str(item.get("response", "") or ""),
+                finding_id=str(item.get("finding_id", "") or ""),
+                duplicate_of=str(item.get("duplicate_of", "") or ""),
             )
         )
     return out
@@ -330,6 +317,7 @@ def findings_json(findings: list[Finding]) -> str:
                 "verdict": f.verdict, "claim": f.claim,
                 "evidence": f.evidence, "suggestion": f.suggestion,
                 "response": f.response,
+                "finding_id": f.finding_id, "duplicate_of": f.duplicate_of,
             }
             for f in findings
         ],
@@ -376,9 +364,9 @@ def open_items_json(
 
 
 def _dedupe(findings: list[Finding]) -> list[Finding]:
-    seen: dict[tuple[str, int], Finding] = {}
+    seen: dict[str | tuple[str, int], Finding] = {}
     for f in findings:
-        seen[_key(f)] = f
+        seen[f.finding_id or _key(f)] = f
     return list(seen.values())
 
 
@@ -553,7 +541,7 @@ def build_independent_prompt(job: ReviewJob, diff: str, findings_path: str, *, r
 You are one of two independent code reviewers in an "agent fight". You and a
 rival reviewer -- a different AI harness -- review this pull request separately,
 then argue it out over up to {round_cap} rounds until you agree. This is round 0:
-your independent review. The rival cannot see you yet.
+your independent review. Do not read any other reviewer's findings or session files.
 
 PULL REQUEST
 {_pr_header(job)}
@@ -668,6 +656,43 @@ will cost another round. Write the file -- console output is ignored.
 """
 
 
+def _response_contract(payload):
+    return """
+STABLE FINDING IDs AND RESPONSE CONTRACT (authoritative)
+Use the supplied finding_id on every response, even if the line/wording changes.
+The coordinator keeps settled findings. Only return responses to assigned IDs.
+Do not create a second ID for the same finding or omit an opposing finding.
+`agree` accepts the current supplied claim AND severity; leave those unchanged.
+`disagree` rejects it, with code evidence in response. `revised` proposes a
+materially different claim or severity and needs the other reviewer's acceptance.
+An author uses `issue` to defend their claim, `resolved` to withdraw it.
+If withdrawing your duplicate, use resolved and duplicate_of=<existing ID>.
+If a concrete new defect is discovered, omit finding_id; it will get a new ID
+and need the other reviewer's response. Do not add summaries or approvals.
+ASSIGNED ITEMS (with original owner and latest arguments)
+""" + json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def build_response_prompt(job, payload, round_no, round_cap, findings_path):
+    return f"""This is round {round_no} of {round_cap} of the agent fight.
+Answer ONLY the assigned open items below. Each item names who originally
+raised it and contains the last objection/rebuttal. You owe the next response.
+Consult the relevant code to verify those specific arguments. Do not restart a
+broad PR review or re-read settled findings. An author's withdrawal ends that
+claim immediately. Defending it routes the rebuttal back to the challenger.
+
+PULL REQUEST
+{_pr_header(job)}
+{_MATERIAL}
+{_STANDARDS}
+
+OUTPUT -- write JSON to {findings_path}
+Write a JSON list of responses with finding_id, file, line, claim, severity,
+evidence, suggestion, verdict, response, and optional duplicate_of.
+An empty list leaves the assigned items unanswered; it is not agreement.
+""" + _response_contract(payload)
+
+
 async def run_review(
     job: ReviewJob,
     settings: Settings,
@@ -675,37 +700,36 @@ async def run_review(
     runner: ContainerRunner,
     ado_client,
     harnesses: Optional[list[HarnessType]] = None,
-    judge: Optional[Judge] = None,
     post_back: bool = True,
     progress=None,
 ) -> ReviewOutcome:
-    """Run the full review for one PR and return a `ReviewOutcome`.
+    """Run parallel rounds 0/1, then only agents owing a response.
 
-    Structure: an unnumbered independent-review prep phase (both agents review
-    the pull request blind), then up to `settings.round_cap` fight rounds in
-    which each agent re-reviews the code with the rival's findings in hand and
-    marks every item agree / disagree / revised / resolved. After each round the
-    `judge` rules on whether the fight is settled. The review's content is the
-    agents' own findings, diffed by `convergence` — the judge never writes it.
-
-    `runner` provides the container; `judge` is the coordinator LLM (defaults to
-    the deterministic `_fallback_judge`); `ado_client` posts the result unless
-    `post_back` is False.
-
-    The returned `ReviewOutcome` carries the posted markdown plus the metrics the
-    runner persists. Failures raise `ReviewFailure` (recorded as `failed`) — they
-    never return an outcome, and nothing is posted.
+    The ledger preserves settled findings across partial rounds and closes an
+    author's withdrawal immediately. Failed/cancelled batches join every task
+    before container teardown and never reach post-back. Progress callbacks are
+    serialized so the runner's single database session is safe.
     """
     harnesses = harnesses or [HarnessType.CLAUDE, HarnessType.CODEX]
-    if len(harnesses) != 2:
+    if len(harnesses) != 2 or len(set(harnesses)) != 2:
         raise ValueError("the review expects exactly two harnesses")
-    judge = judge or _fallback_judge
     round_cap = max(1, int(settings.round_cap))
-    h1, h2 = harnesses
+    h1 = harnesses[0]
+
+    progress_lock = asyncio.Lock()
 
     async def emit(kind, phase, message, *, role=None, round_no=None):
         if progress is not None:
-            await progress(kind, phase, message, role=role, round_no=round_no)
+            # The runner owns one AsyncSession. Never commit it concurrently.
+            async with progress_lock:
+                write = asyncio.create_task(progress(kind, phase, message, role=role, round_no=round_no))
+                try:
+                    await asyncio.shield(write)
+                except asyncio.CancelledError:
+                    # Finish the database operation before cancelling this agent;
+                    # interrupting commit can invalidate the shared connection.
+                    await write
+                    raise
 
     usage_records: list[RoleRoundUsage] = []
     raw_records: list[RawFindings] = []
@@ -771,86 +795,77 @@ async def run_review(
         else:
             logger.warning("PR %s: no ADO client — reviewing without PR context", job.pr_id)
 
-        prev: dict[HarnessType, list[Finding]] = {}
+        from app.review.ledger import FindingLedger
 
-        # ---- Independent review (prep phase — NOT a round) ------------------ #
-        # Both agents review blind. This builds the prerequisites for a fight; it
-        # is not a fight round and no judgment runs yet.
-        logger.info("PR %s: independent review (both agents, blind)", job.pr_id)
-        await emit("phase_started", "independent_review", "Independent review started")
-        for h in harnesses:
-            await emit("agent_started", "independent_review", f"{h.value.title()} reviewing", role=h.value, round_no=0)
-            fpath = _independent_path(h)
-            prev[h] = await _run_harness(
-                h,
-                build_independent_prompt(job, diff, fpath, round_cap=round_cap),
-                fpath, round_no=0, phase="independent review",
-            )
-            await emit("agent_completed", "independent_review", f"{h.value.title()} completed with {len(prev[h])} finding(s)", role=h.value, round_no=0)
+        async def batch(prompts, round_no, phase):
+            async def one(h, prompt, path):
+                await emit("agent_started", phase, f"{h.value.title()} started round {round_no}",
+                           role=h.value, round_no=round_no)
+                result = await _run_harness(h, prompt, path, round_no, phase)
+                await emit("agent_completed", phase, f"{h.value.title()} completed with {len(result)} response(s)",
+                           role=h.value, round_no=round_no)
+                return h.value, result
 
-        # ---- Fight rounds --------------------------------------------------- #
-        decision: Optional[CoordinatorDecision] = None
-        result = convergence(prev[h1], prev[h2])
+            tasks = [asyncio.create_task(one(h, prompt, path)) for h, prompt, path in prompts]
+            try:
+                return dict(await asyncio.gather(*tasks))
+            except BaseException as exc:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                if isinstance(exc, ReviewFailure):
+                    exc.usage = list(usage_records)
+                raise
+
+        await emit("phase_started", "independent_review", "Independent reviews started in parallel")
+        independent = await batch([
+            (h, build_independent_prompt(job, diff, _independent_path(h), round_cap=round_cap),
+             _independent_path(h)) for h in harnesses
+        ], 0, "independent_review")
+        ledger = FindingLedger(independent)
         for round_no in range(1, round_cap + 1):
-            rounds_used = round_no
-            await emit("round_started", "fight", f"Fight round {round_no} started", round_no=round_no)
-            # Snapshot before either agent runs, so both fight the same opponent
-            # state. Reading `prev` live would hand the second agent the first
-            # agent's brand-new findings while the first saw only last round's —
-            # a first-mover advantage that quietly shapes who concedes.
-            opening = dict(prev)
-            open_disagreements = list(result.disagreements)
-            unanswered = list(result.unmatched)
-
-            for h in harnesses:
-                other = h2 if h is h1 else h1
-                fpath = _findings_path(h, round_no)
-                prompt = build_fight_prompt(
-                    job,
-                    own=opening.get(h, []),
-                    other=opening.get(other, []),
-                    disagreements=open_disagreements,
-                    unanswered=unanswered,
-                    round_no=round_no,
-                    round_cap=round_cap,
-                    findings_path=fpath,
-                    own_is_left=h is h1,
-                )
-                prev[h] = await _run_harness(
-                    h, prompt, fpath, round_no=round_no, phase=f"round {round_no}"
-                )
-                await emit("agent_completed", "fight", f"{h.value.title()} completed round {round_no} with {len(prev[h])} finding(s)", role=h.value, round_no=round_no)
-
-            # The agents' own marks decide what the review says; the judge only
-            # decides whether the fight is over (and what to vote).
-            result = convergence(prev[h1], prev[h2])
-            decision, judge_usage = _unpack_judgment(
-                await judge(prev[h1], prev[h2], round_no, round_cap)
-            )
-            if judge_usage is not None and not judge_usage.is_empty:
-                usage_records.append(RoleRoundUsage("coordinator", round_no, judge_usage))
-
-            logger.info(
-                "PR %s round %s of %s: agreed=%s disputed=%s unanswered=%s converged=%s (%s)",
-                job.pr_id, round_no, round_cap,
-                len(result.converged), len(result.disagreements), len(result.unmatched),
-                decision.converged, decision.summary or "no reason given",
-            )
-            if decision.converged:
-                await emit("round_completed", "fight", f"Round {round_no} converged", round_no=round_no)
-                logger.info("PR %s converged after round %s", job.pr_id, round_no)
+            if ledger.complete:
                 break
+            rounds_used = round_no
+            assignments = {h.value: ledger.assigned(h.value, round_no) for h in harnesses}
+            await emit("round_started", "fight", f"Fight round {round_no} started", round_no=round_no)
+            prompts = []
+            for h in harnesses:
+                ids = assignments[h.value]
+                if round_no > 1 and not ids:
+                    await emit("agent_skipped", "fight", f"{h.value.title()} owes no response",
+                               role=h.value, round_no=round_no)
+                    continue
+                path = _findings_path(h, round_no)
+                payload = ledger.payload(h.value, ids)
+                if round_no == 1:
+                    prompt = build_fight_prompt(
+                        job, own=ledger.review(h.value), other=ledger.review(ledger.other(h.value)),
+                        disagreements=[], unanswered=[], round_no=round_no, round_cap=round_cap,
+                        findings_path=path, own_is_left=h is h1,
+                    )
+                    prompt += _response_contract(payload)
+                else:
+                    prompt = build_response_prompt(job, payload, round_no, round_cap, path)
+                prompts.append((h, prompt, path))
+            responses = await batch(prompts, round_no, "fight")
+            ledger.apply(responses, round_no, assignments)
+            result = ledger.result()
+            logger.info("PR %s round %s of %s: agreed=%s disputed=%s unanswered=%s converged=%s",
+                        job.pr_id, round_no, round_cap, len(result.converged),
+                        len(result.disagreements), len(result.unmatched), ledger.complete)
+            await emit("round_completed", "fight",
+                       f"Round {round_no}: {len(result.converged)} agreed, "
+                       f"{len(result.disagreements) + len(result.unmatched)} open",
+                       round_no=round_no)
 
+        result = ledger.result()
         agreed = list(result.converged)
         disagreed = list(result.disagreements)
         unmatched = list(result.unmatched)
-
-        # Reviewer vote: the coordinator's recommendation, else derived from the
-        # findings. Included in the comment and cast on the PR below.
-        if decision is not None and decision.vote in _ALLOWED_VOTES and decision.vote != 0:
-            vote, vote_reason = decision.vote, (decision.vote_reason or vote_label(decision.vote))
-        else:
-            vote, vote_reason = _derive_vote(agreed + unmatched, disagreed)
+        vote, vote_reason = _derive_vote(agreed + unmatched, disagreed)
+        if not ledger.complete:
+            vote, vote_reason = VOTE_WAIT, "round cap reached with responses still owed"
 
         review_md = synthesize_final_review(
             agreed, disagreed, unmatched,
@@ -862,7 +877,7 @@ async def run_review(
 
     # Reaching here means every harness in every phase succeeded (any fault
     # raised ReviewFailure above), so this review is safe to post.
-    status = "converged" if (decision and decision.converged) else "capped"
+    status = "converged" if ledger.complete else "capped"
     if post_back and ado_client is not None:
         logger.info(
             "PR %s posting review: status=%s rounds=%s agreed=%s disagreed=%s vote=%s(%s)",
@@ -951,10 +966,23 @@ def _read_findings_or_fail(
     if raw is None:
         raise _fail("wrote no findings file")
     try:
-        json.loads(raw)
+        data = json.loads(raw)
     except (ValueError, TypeError):
         raise _fail("wrote an unparseable (non-JSON) findings file")
-    return parse_findings(raw)
+    if isinstance(data, dict):
+        data = data.get("findings")
+    if not isinstance(data, list):
+        raise _fail("wrote an invalid findings envelope")
+    for row in data:
+        if not isinstance(row, dict) or not row.get("file") or not row.get("claim"):
+            raise _fail("wrote an invalid finding row")
+        if not isinstance(row.get("line", 0), int) or isinstance(row.get("line"), bool):
+            raise _fail("wrote an invalid finding line")
+        if row.get("verdict", "issue") not in {"issue", "agree", "disagree", "revised", "resolved"}:
+            raise _fail("wrote an invalid finding verdict")
+        if round_no == 0 and row.get("verdict", "issue") != "issue":
+            raise _fail("independent findings must assert an issue")
+    return parse_findings(json.dumps(data))
 
 
 def _unpack_judgment(

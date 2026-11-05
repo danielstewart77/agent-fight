@@ -305,14 +305,6 @@ def _findings_json(items):
     return json.dumps({"findings": items})
 
 
-def _judge(converged, vote=None):
-    """A fake judge: rules on the fight, supplies no findings (the real one
-    can't either — the review's content comes from the agents)."""
-    async def j(left, right, round_no, round_cap):
-        return CoordinatorDecision(converged=converged, vote=vote)
-    return j
-
-
 def _seed(indep=None, rounds=None):
     """Build a FakeHandle.files dict seeding the independent (prep) findings and
     each fight round. A value may be one items list (both harnesses wrote the
@@ -348,13 +340,13 @@ class _RecordingAdo:
         self.voted = vote
 
 
-async def test_prep_phase_then_judge_converges_round1():
+async def test_independent_then_cross_review_converges_round1():
     bug = [{"file": "a.py", "line": 10, "claim": "bug", "severity": "major", "verdict": "issue"}]
     handle = FakeHandle(files=_seed(indep=bug, rounds={1: bug}))
     ado = _RecordingAdo()
     outcome = await run_review(
         _job(), _settings(round_cap=5), runner=FakeRunner(handle),
-        ado_client=ado, judge=_judge(True),
+        ado_client=ado,
     )
     assert outcome.status == "converged"
     assert outcome.rounds_used == 1           # fight rounds; prep is not counted
@@ -380,11 +372,11 @@ async def test_cap_hit_surfaces_disagreement():
     rejects = [{"file": "a.py", "line": 10, "claim": "leak", "verdict": "disagree",
                 "response": "Foo.cs:88 disposes it in the finally"}]
     fight = (holds, rejects)
-    handle = FakeHandle(files=_seed(indep=fight, rounds={1: fight, 2: fight}))
+    handle = FakeHandle(files=_seed(indep=(holds, []), rounds={1: fight, 2: fight}))
     ado = _RecordingAdo()
     outcome = await run_review(
         _job(), _settings(round_cap=2), runner=FakeRunner(handle),
-        ado_client=ado, judge=_judge(False),
+        ado_client=ado,
     )
     assert outcome.status == "capped"
     assert outcome.rounds_used == 2
@@ -398,48 +390,21 @@ async def test_cap_hit_surfaces_disagreement():
     assert outcome.vote == -5 and ado.voted == -5
 
 
-async def test_judge_supplied_vote_is_honored():
-    bug = [{"file": "a.py", "line": 1, "claim": "bug", "severity": "minor",
-            "verdict": "issue"}]
-    handle = FakeHandle(files=_seed(indep=bug, rounds={1: bug}))
-    ado = _RecordingAdo()
-
-    async def judge(left, right, round_no, round_cap):
-        # Judge explicitly approves-with-suggestions despite a finding.
-        return CoordinatorDecision(
-            converged=True, vote=5, vote_reason="minor only, safe to merge",
-        )
-
-    outcome = await run_review(
-        _job(), _settings(round_cap=2), runner=FakeRunner(handle),
-        ado_client=ado, judge=judge,
-    )
-    assert outcome.vote == 5           # judge's vote used, not re-derived
-    assert ado.voted == 5
-    assert "safe to merge" in outcome.review_md
-    # The judge supplied no findings, and could not have: the review is the
-    # agents' own text.
-    assert "bug" in outcome.review_md
-
-
-async def test_review_content_comes_from_agents_not_the_judge():
+async def test_review_preserves_agents_claim():
     """The judge cannot add, drop, or reword a finding — even if it tries."""
     real = [{"file": "a.py", "line": 7, "claim": "agent wrote this", "verdict": "issue"}]
     handle = FakeHandle(files=_seed(indep=real, rounds={1: real}))
     ado = _RecordingAdo()
 
-    async def meddling_judge(left, right, round_no, round_cap):
-        return CoordinatorDecision(converged=True, summary="judge wrote this")
-
     outcome = await run_review(
         _job(), _settings(round_cap=1), runner=FakeRunner(handle),
-        ado_client=ado, judge=meddling_judge,
+        ado_client=ado,
     )
     assert "agent wrote this" in outcome.review_md
     assert "judge wrote this" not in outcome.review_md
 
 
-async def test_default_fallback_judge_converges_on_agreement():
+async def test_ledger_converges_on_agreement():
     # No judge injected -> deterministic fallback (convergence()); both agree.
     bug = [{"file": "a.py", "line": 1, "claim": "bug", "verdict": "issue"}]
     handle = FakeHandle(files=_seed(indep=bug, rounds={1: bug}))
@@ -512,24 +477,6 @@ async def test_unparseable_findings_file_aborts_and_does_not_post():
     assert ado.posted is None
 
 
-async def test_judge_error_aborts_and_does_not_post():
-    # The coordinator judge itself fails -> fail closed, nothing posted.
-    bug = [{"file": "a.py", "line": 1, "claim": "bug", "verdict": "issue"}]
-    handle = FakeHandle(files=_seed(indep=bug, rounds={1: bug}))
-    ado = _RecordingAdo()
-
-    async def boom_judge(left, right, round_no, round_cap):
-        raise ReviewFailure("judge blew up", round_no=round_no, reason="judge call failed")
-
-    with pytest.raises(ReviewFailure) as ei:
-        await run_review(
-            _job(), _settings(round_cap=2), runner=FakeRunner(handle),
-            ado_client=ado, judge=boom_judge,
-        )
-    assert ei.value.reason == "judge call failed"
-    assert ado.posted is None
-
-
 async def test_genuine_empty_findings_is_clean_and_posts():
     # BOTH harnesses ran fine and wrote present, valid, EMPTY findings files
     # (prep + round 1). Fallback judge converges -> a real clean, which posts.
@@ -599,7 +546,7 @@ async def test_both_fighters_see_the_same_opponent_state():
     handle = FakeHandle(files=_seed(indep=indep, rounds={1: rnd1}))
     await run_review(
         _job(), _settings(round_cap=1), runner=FakeRunner(handle),
-        ado_client=None, judge=_judge(True), post_back=False,
+        ado_client=None, post_back=False,
     )
     fight_prompts = [p for p in handle.stdin_log if p and "agent fight over this" in p]
     assert len(fight_prompts) == 2
@@ -615,7 +562,7 @@ async def test_harnesses_get_ado_credentials_to_read_the_pr():
     settings.ado_pat = "pat-123"
     await run_review(
         _job(), settings, runner=FakeRunner(handle),
-        ado_client=None, judge=_judge(True), post_back=False,
+        ado_client=None, post_back=False,
     )
     env = handle.env_log[-1]
     assert env["ADO_AUTH_HEADER"].startswith("Basic ")

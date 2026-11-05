@@ -85,6 +85,10 @@ class Finding:
     # wrong. Never dropped — a rebuttal is the whole point of the fight, and it
     # is rendered verbatim for any item that stays contested.
     response: str = ""
+    # Assigned by the coordinator; remains stable across anchor/claim revisions.
+    finding_id: str = ""
+    # An author's withdrawal may identify the surviving duplicate's stable ID.
+    duplicate_of: str = ""
 
 
 @dataclass(frozen=True)
