@@ -88,10 +88,23 @@ def test_shared_original_finding_drops_when_one_withdraws_and_other_rejects():
     assert not result.converged and not result.disagreements and not result.unmatched
 
 
-def test_mutual_duplicate_withdrawals_fail_instead_of_losing_the_issue():
+def test_mutual_duplicate_withdrawals_remain_open_for_author_clarification():
     ledger = FindingLedger({'claude':[Finding('a.py',10,'leak')], 'codex':[Finding('a.py',11,'same leak')]})
     left,right='claude-0-1','codex-0-1'
-    with pytest.raises(ReviewFailure):
-        ledger.apply({'claude':[response(ledger,left,'resolved',duplicate_of=right)],
-                      'codex':[response(ledger,right,'resolved',duplicate_of=left)]},1,
-                     {'claude':[left,right],'codex':[left,right]})
+    ledger.apply({'claude':[response(ledger,left,'resolved',duplicate_of=right)],
+                  'codex':[response(ledger,right,'resolved',duplicate_of=left)]},1,
+                 {'claude':[left,right],'codex':[left,right]})
+    assert not ledger.complete
+    assert ledger.assigned('claude',2) == [left]
+    assert ledger.assigned('codex',2) == [right]
+    assert {f.claim for f in ledger.result().unmatched} == {'leak', 'same leak'}
+    # Explicitly keep one claim and consolidate the other, then require the
+    # challenger to accept the retained claim against the new snapshot.
+    ledger.apply({'claude':[response(ledger,left,'issue')],
+                  'codex':[response(ledger,right,'resolved',duplicate_of=left)]},2,
+                 {'claude':[left],'codex':[right]})
+    assert ledger.assigned('codex',3) == [left]
+    ledger.apply({'codex':[response(ledger,left,'agree')]},3,
+                 {'claude':[],'codex':[left]})
+    assert ledger.complete
+    assert [f.claim for f in ledger.result().converged] == ['leak']

@@ -231,6 +231,7 @@ class ReviewFailure(RuntimeError):
         rc: Optional[int] = None,
         reason: Optional[str] = None,
         usage: Optional[list["RoleRoundUsage"]] = None,
+        raw_findings: Optional[list["RawFindings"]] = None,
     ) -> None:
         super().__init__(message)
         self.harness = harness
@@ -238,6 +239,7 @@ class ReviewFailure(RuntimeError):
         self.rc = rc
         self.reason = reason
         self.usage = usage or []
+        self.raw_findings = raw_findings or []
 
 
 @dataclass(frozen=True)

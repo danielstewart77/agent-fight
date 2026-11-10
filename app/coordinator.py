@@ -667,6 +667,14 @@ Do not create a second ID for the same finding or omit an opposing finding.
 materially different claim or severity and needs the other reviewer's acceptance.
 An author uses `issue` to defend their claim, `resolved` to withdraw it.
 If withdrawing your duplicate, use resolved and duplicate_of=<existing ID>.
+Only an author's resolved response can withdraw a duplicate; on other responses
+duplicate_of is only a hint. The target must lead to a surviving claim. A loop,
+self/missing target, or already-withdrawn terminal leaves your claim open with
+reason "clarify duplicate withdrawal". To clarify, defend the retained claim
+with issue, point resolved/duplicate_of to a surviving claim, or explicitly
+withdraw a non-issue with resolved and NO duplicate_of. Never drop every copy
+of a real defect by pointing duplicates at one another. Agreement with your own
+retained claim is a defense; the challenger must still accept it.
 If a concrete new defect is discovered, omit finding_id; it will get a new ID
 and need the other reviewer's response. Do not add summaries or approvals.
 ASSIGNED ITEMS (with original owner and latest arguments)
@@ -772,141 +780,153 @@ async def run_review(
             h, round_no, exec_res, raw, usage_records, phase=phase,
         )
 
-    async with runner.start(job) as handle:
-        await emit("phase_started", "preparing_repository", "Preparing repository")
-        await prepare_repo(
-            handle,
-            job,
-            clone_credential_kind=settings.clone_credential_kind,
-            clone_credential_secret=settings.clone_credential_secret,
-        )
-        await provision_harnesses(handle, settings)
-        diff = await compute_diff(handle, job)
-        await emit("phase_completed", "preparing_repository", "Repository prepared")
-        if not diff.strip():
-            # Not a failure (the branch may genuinely add nothing), but log it —
-            # an empty diff is also the fingerprint of a bad ref/checkout.
-            logger.warning("PR %s: computed diff is EMPTY — reviewers will see no changes", job.pr_id)
-        # The pull request itself — description, work items, and every comment
-        # thread, including the author's replies to our last review. Reviewers
-        # must never re-raise a finding the author already refuted.
-        if ado_client is not None:
-            await write_pr_context(handle, await ado_client.fetch_pr_context(settings, job))
-        else:
-            logger.warning("PR %s: no ADO client — reviewing without PR context", job.pr_id)
+    try:
+        async with runner.start(job) as handle:
+            await emit("phase_started", "preparing_repository", "Preparing repository")
+            await prepare_repo(
+                handle,
+                job,
+                clone_credential_kind=settings.clone_credential_kind,
+                clone_credential_secret=settings.clone_credential_secret,
+            )
+            await provision_harnesses(handle, settings)
+            diff = await compute_diff(handle, job)
+            await emit("phase_completed", "preparing_repository", "Repository prepared")
+            if not diff.strip():
+                # Not a failure (the branch may genuinely add nothing), but log it —
+                # an empty diff is also the fingerprint of a bad ref/checkout.
+                logger.warning("PR %s: computed diff is EMPTY — reviewers will see no changes", job.pr_id)
+            # The pull request itself — description, work items, and every comment
+            # thread, including the author's replies to our last review. Reviewers
+            # must never re-raise a finding the author already refuted.
+            if ado_client is not None:
+                await write_pr_context(handle, await ado_client.fetch_pr_context(settings, job))
+            else:
+                logger.warning("PR %s: no ADO client — reviewing without PR context", job.pr_id)
 
-        from app.review.ledger import FindingLedger
+            from app.review.ledger import FindingLedger
 
-        async def batch(prompts, round_no, phase):
-            async def one(h, prompt, path):
-                await emit("agent_started", phase, f"{h.value.title()} started round {round_no}",
-                           role=h.value, round_no=round_no)
-                result = await _run_harness(h, prompt, path, round_no, phase)
-                await emit("agent_completed", phase, f"{h.value.title()} completed with {len(result)} response(s)",
-                           role=h.value, round_no=round_no)
-                return h.value, result
-
-            tasks = [asyncio.create_task(one(h, prompt, path)) for h, prompt, path in prompts]
-            try:
-                return dict(await asyncio.gather(*tasks))
-            except BaseException as exc:
-                for task in tasks:
-                    task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
-                if isinstance(exc, ReviewFailure):
-                    exc.usage = list(usage_records)
-                raise
-
-        await emit("phase_started", "independent_review", "Independent reviews started in parallel")
-        independent = await batch([
-            (h, build_independent_prompt(job, diff, _independent_path(h), round_cap=round_cap),
-             _independent_path(h)) for h in harnesses
-        ], 0, "independent_review")
-        ledger = FindingLedger(independent)
-        for round_no in range(1, round_cap + 1):
-            if ledger.complete:
-                break
-            rounds_used = round_no
-            assignments = {h.value: ledger.assigned(h.value, round_no) for h in harnesses}
-            await emit("round_started", "fight", f"Fight round {round_no} started", round_no=round_no)
-            prompts = []
-            for h in harnesses:
-                ids = assignments[h.value]
-                if round_no > 1 and not ids:
-                    await emit("agent_skipped", "fight", f"{h.value.title()} owes no response",
+            async def batch(prompts, round_no, phase):
+                async def one(h, prompt, path):
+                    await emit("agent_started", phase, f"{h.value.title()} started round {round_no}",
                                role=h.value, round_no=round_no)
-                    continue
-                path = _findings_path(h, round_no)
-                payload = ledger.payload(h.value, ids)
-                if round_no == 1:
-                    prompt = build_fight_prompt(
-                        job, own=ledger.review(h.value), other=ledger.review(ledger.other(h.value)),
-                        disagreements=[], unanswered=[], round_no=round_no, round_cap=round_cap,
-                        findings_path=path, own_is_left=h is h1,
-                    )
-                    prompt += _response_contract(payload)
-                else:
-                    prompt = build_response_prompt(job, payload, round_no, round_cap, path)
-                prompts.append((h, prompt, path))
-            responses = await batch(prompts, round_no, "fight")
-            ledger.apply(responses, round_no, assignments)
+                    result = await _run_harness(h, prompt, path, round_no, phase)
+                    await emit("agent_completed", phase, f"{h.value.title()} completed with {len(result)} response(s)",
+                               role=h.value, round_no=round_no)
+                    return h.value, result
+
+                tasks = [asyncio.create_task(one(h, prompt, path)) for h, prompt, path in prompts]
+                try:
+                    return dict(await asyncio.gather(*tasks))
+                except BaseException as exc:
+                    for task in tasks:
+                        # Cancelling gather already cancels its children. A second
+                        # cancellation can interrupt a shielded progress commit
+                        # while its first cancellation is being joined.
+                        if not task.done() and not task.cancelling():
+                            task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    if isinstance(exc, ReviewFailure):
+                        exc.usage = list(usage_records)
+                    raise
+
+            await emit("phase_started", "independent_review", "Independent reviews started in parallel")
+            independent = await batch([
+                (h, build_independent_prompt(job, diff, _independent_path(h), round_cap=round_cap),
+                 _independent_path(h)) for h in harnesses
+            ], 0, "independent_review")
+            ledger = FindingLedger(independent)
+            for round_no in range(1, round_cap + 1):
+                if ledger.complete:
+                    break
+                rounds_used = round_no
+                assignments = {h.value: ledger.assigned(h.value, round_no) for h in harnesses}
+                await emit("round_started", "fight", f"Fight round {round_no} started", round_no=round_no)
+                prompts = []
+                for h in harnesses:
+                    ids = assignments[h.value]
+                    if round_no > 1 and not ids:
+                        await emit("agent_skipped", "fight", f"{h.value.title()} owes no response",
+                                   role=h.value, round_no=round_no)
+                        continue
+                    path = _findings_path(h, round_no)
+                    payload = ledger.payload(h.value, ids)
+                    if round_no == 1:
+                        prompt = build_fight_prompt(
+                            job, own=ledger.review(h.value), other=ledger.review(ledger.other(h.value)),
+                            disagreements=[], unanswered=[], round_no=round_no, round_cap=round_cap,
+                            findings_path=path, own_is_left=h is h1,
+                        )
+                        prompt += _response_contract(payload)
+                    else:
+                        prompt = build_response_prompt(job, payload, round_no, round_cap, path)
+                    prompts.append((h, prompt, path))
+                responses = await batch(prompts, round_no, "fight")
+                ledger.apply(responses, round_no, assignments)
+                result = ledger.result()
+                logger.info("PR %s round %s of %s: agreed=%s disputed=%s unanswered=%s converged=%s",
+                            job.pr_id, round_no, round_cap, len(result.converged),
+                            len(result.disagreements), len(result.unmatched), ledger.complete)
+                await emit("round_completed", "fight",
+                           f"Round {round_no}: {len(result.converged)} agreed, "
+                           f"{len(result.disagreements) + len(result.unmatched)} open",
+                           round_no=round_no)
+
             result = ledger.result()
-            logger.info("PR %s round %s of %s: agreed=%s disputed=%s unanswered=%s converged=%s",
-                        job.pr_id, round_no, round_cap, len(result.converged),
-                        len(result.disagreements), len(result.unmatched), ledger.complete)
-            await emit("round_completed", "fight",
-                       f"Round {round_no}: {len(result.converged)} agreed, "
-                       f"{len(result.disagreements) + len(result.unmatched)} open",
-                       round_no=round_no)
+            agreed = list(result.converged)
+            disagreed = list(result.disagreements)
+            unmatched = list(result.unmatched)
+            vote, vote_reason = _derive_vote(agreed + unmatched, disagreed)
+            if not ledger.complete:
+                vote, vote_reason = VOTE_WAIT, "round cap reached with responses still owed"
 
-        result = ledger.result()
-        agreed = list(result.converged)
-        disagreed = list(result.disagreements)
-        unmatched = list(result.unmatched)
-        vote, vote_reason = _derive_vote(agreed + unmatched, disagreed)
-        if not ledger.complete:
-            vote, vote_reason = VOTE_WAIT, "round cap reached with responses still owed"
+            review_md = synthesize_final_review(
+                agreed, disagreed, unmatched,
+                reviewed=(f"`{job.source_branch}` → `{job.target_branch}`"
+                          + (f" at source `{job.source_commit}`, target `{job.target_commit}`"
+                             if job.target_commit else "")),
+            )
+            review_md += f"\n\n---\n**Reviewer vote:** {vote_label(vote)} — {vote_reason}\n"
 
-        review_md = synthesize_final_review(
-            agreed, disagreed, unmatched,
-            reviewed=(f"`{job.source_branch}` → `{job.target_branch}`"
-                      + (f" at source `{job.source_commit}`, target `{job.target_commit}`"
-                         if job.target_commit else "")),
+        # Reaching here means every harness in every phase succeeded (any fault
+        # raised ReviewFailure above), so this review is safe to post.
+        status = "converged" if ledger.complete else "capped"
+        if post_back and ado_client is not None:
+            logger.info(
+                "PR %s posting review: status=%s rounds=%s agreed=%s disagreed=%s vote=%s(%s)",
+                job.pr_id, status, rounds_used, len(agreed), len(disagreed), vote, vote_label(vote),
+            )
+            revision = await ado_client.post_pr_review(settings, job, review_md)
+            logger.info("PR %s review posted as a new thread (revision %s)", job.pr_id, revision)
+            # Voting is best-effort: a failed/rejected vote (e.g. on a completed PR)
+            # must not fail an otherwise-successful review.
+            try:
+                await ado_client.set_pr_vote(settings, job, vote)
+                logger.info("PR %s vote cast: %s (%s)", job.pr_id, vote, vote_label(vote))
+            except Exception as exc:  # noqa: BLE001 - vote is secondary to the posted review
+                logger.warning("PR %s vote NOT cast (%s): %s", job.pr_id, vote_label(vote), exc)
+        else:
+            logger.info("PR %s review complete (post_back disabled)", job.pr_id)
+
+        return ReviewOutcome(
+            review_md=review_md,
+            status=status,
+            rounds_used=rounds_used,
+            converged_count=len(agreed),
+            disagreement_count=len(disagreed),
+            unmatched_count=len(unmatched),
+            usage=usage_records,
+            raw_findings=raw_records,
+            vote=vote,
+            vote_reason=vote_reason,
         )
-        review_md += f"\n\n---\n**Reviewer vote:** {vote_label(vote)} — {vote_reason}\n"
 
-    # Reaching here means every harness in every phase succeeded (any fault
-    # raised ReviewFailure above), so this review is safe to post.
-    status = "converged" if ledger.complete else "capped"
-    if post_back and ado_client is not None:
-        logger.info(
-            "PR %s posting review: status=%s rounds=%s agreed=%s disagreed=%s vote=%s(%s)",
-            job.pr_id, status, rounds_used, len(agreed), len(disagreed), vote, vote_label(vote),
-        )
-        revision = await ado_client.post_pr_review(settings, job, review_md)
-        logger.info("PR %s review posted as a new thread (revision %s)", job.pr_id, revision)
-        # Voting is best-effort: a failed/rejected vote (e.g. on a completed PR)
-        # must not fail an otherwise-successful review.
-        try:
-            await ado_client.set_pr_vote(settings, job, vote)
-            logger.info("PR %s vote cast: %s (%s)", job.pr_id, vote, vote_label(vote))
-        except Exception as exc:  # noqa: BLE001 - vote is secondary to the posted review
-            logger.warning("PR %s vote NOT cast (%s): %s", job.pr_id, vote_label(vote), exc)
-    else:
-        logger.info("PR %s review complete (post_back disabled)", job.pr_id)
-
-    return ReviewOutcome(
-        review_md=review_md,
-        status=status,
-        rounds_used=rounds_used,
-        converged_count=len(agreed),
-        disagreement_count=len(disagreed),
-        unmatched_count=len(unmatched),
-        usage=usage_records,
-        raw_findings=raw_records,
-        vote=vote,
-        vote_reason=vote_reason,
-    )
+    except (Exception, asyncio.CancelledError) as exc:
+        # The outer boundary also covers ledger, progress, teardown and posting
+        # failures. Concurrent tasks have been joined before evidence is attached.
+        exc.usage = list(usage_records)
+        exc.raw_findings = list(raw_records)
+        raise
 
 
 async def _read_or_none(handle, path: str) -> Optional[str]:

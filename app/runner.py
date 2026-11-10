@@ -187,6 +187,11 @@ async def run_and_record(
                 )
             )
 
+    def _persist_findings(records) -> None:
+        for rf in records:
+            session.add(ReviewFinding(review_id=review.id, role=rf.role,
+                                      round_no=rf.round_no, raw=rf.raw))
+
     started = time.monotonic()
     try:
         outcome = await run_review(
@@ -208,6 +213,7 @@ async def run_and_record(
         review.finished_at = _utcnow()
         review.duration_ms = int((time.monotonic() - started) * 1000)
         _persist_usage(getattr(exc, "usage", None) or [])  # partial spend, if any
+        _persist_findings(getattr(exc, "raw_findings", None) or [])
         await session.commit()
         logger.error(
             "PR %s review FAILED — nothing posted to the PR (review #%s marked failed): %s",
@@ -229,12 +235,7 @@ async def run_and_record(
     _persist_usage(outcome.usage)
     # Keep every agent's raw output beside the comment it produced, so a review
     # that reads wrong can be explained from the source rather than guessed at.
-    for rf in outcome.raw_findings:
-        session.add(
-            ReviewFinding(
-                review_id=review.id, role=rf.role, round_no=rf.round_no, raw=rf.raw
-            )
-        )
+    _persist_findings(outcome.raw_findings)
     await session.commit()
     logger.info(
         "PR %s review #%s complete: status=%s rounds=%s findings=%s",
