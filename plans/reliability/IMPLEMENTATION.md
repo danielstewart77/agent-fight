@@ -57,4 +57,5 @@ Production rollout must derive from the current security-patched image, validate
 candidate files and image first, then wait for no active/queued review before
 switching. Back up selected source and DB, preserve dirty source, verify health,
 image/file hashes and live review evidence. Existing directed-review deployment
-scripts/documentation provide the rollback pattern. Deployment remains pending.
+scripts/documentation provide the rollback pattern. The repair was deployed
+2026-11-10; see PRODUCTION-DEPLOYMENT.md for verification and rollback.

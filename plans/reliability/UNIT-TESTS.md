@@ -1,7 +1,7 @@
 # Test map — protection-list delta v2 accepted 2026-11-10
 
 All cases belong to our gate and call imported production code. Expected results
-derive from the proposed behavior in IMPLEMENTATION.md, subject to acceptance.
+derive from the accepted behavior in IMPLEMENTATION.md.
 Transport/container responses are the only scripted review boundary. Tests use
 isolated SQLite fixtures; no operational database writes or model-output grading.
 

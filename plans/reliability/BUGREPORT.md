@@ -3,7 +3,8 @@
 Host: ulhgpuhamster, account daniel, SSH public-key access. Service agent-fight,
 image agent-fight:directed-6105be5. Investigation used read-only SQLite connections.
 Repair workspace: agent-fight-reliability, branch fix/duplicate-review-reliability,
-base 00ef657. No application changes or deployment have been made.
+base 00ef657. These observations preceded the repair; deployment details are
+recorded in PRODUCTION-DEPLOYMENT.md.
 
 ## Observed incidence
 

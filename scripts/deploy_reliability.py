@@ -73,9 +73,11 @@ def prepare(bundle, commit):
     for file in FILES:
         shutil.copy2(backup/'candidate'/file,stage/file)
     shutil.copytree(backup/'candidate/tests',stage/'tests')
+    shutil.copytree(backup/'candidate/scripts',stage/'scripts')
     shutil.copy2(backup/'candidate/pytest.ini',stage/'pytest.ini')
-    (stage/'Dockerfile').write_text('FROM '+old_image+'\nCOPY app/ /app/app/\n'
+    (stage/'Dockerfile').write_text('FROM '+rollback+'\nCOPY app/ /app/app/\n'
         'LABEL org.opencontainers.image.revision="'+commit+'"\n')
+    (stage/'.dockerignore').write_text('**/__pycache__\n**/*.pyc\ntests\nscripts\n')
     meta=dict(backup=str(backup),commit=commit,old_image=old_image,
               old_tag=info['Config']['Image'],rollback=rollback,candidate=candidate,
               hashes={f:hashlib.sha256((backup/'candidate'/f).read_bytes()).hexdigest() for f in FILES})
@@ -90,13 +92,36 @@ def check(backup,meta):
     (backup/'linux-tests.log').write_text(result.stdout)
     print(result.stdout)
     assert result.returncode==0, 'Linux regression suite failed'
+    check_image(backup,meta)
+
+
+def check_image(backup,meta):
+    import re
+    assert re.search(r'\d+ passed in ',(backup/'linux-tests.log').read_text().splitlines()[-1]), 'Linux gate not passed'
+    assert run('docker','image','inspect','--format={{.Id}}',meta['rollback'])==meta['old_image']
+    # BuildKit interprets a raw sha256 image ID as a registry reference. Use the
+    # pinned local rollback tag, whose immutable image identity was checked.
+    (backup/'release/Dockerfile').write_text('FROM '+meta['rollback']+'\nCOPY app/ /app/app/\n'
+        'LABEL org.opencontainers.image.revision="'+meta['commit']+'"\n')
+    (backup/'release/.dockerignore').write_text('**/__pycache__\n**/*.pyc\ntests\nscripts\n')
     run('docker','build','-t',meta['candidate'],str(backup/'release'))
     # Exercise real runner/coordinator/ledger from the actual image. Pytest and
     # test-only libraries come from the existing host venv via a read-only mount.
     sites=list((P/'.venv/lib').glob('python*/site-packages'))
     assert len(sites)==1,sites
+    # Copy only pure-Python test tooling. Mounting the whole Python 3.12 venv
+    # would shadow the image's Python 3.11 native runtime dependencies.
+    test_deps=backup/'test-deps'
+    test_deps.mkdir(exist_ok=True)
+    for package in ['pytest','_pytest','pytest_asyncio','pluggy','iniconfig','packaging','py']:
+        if (sites[0]/package).is_dir():
+            shutil.copytree(sites[0]/package,test_deps/package,dirs_exist_ok=True)
+        else:
+            shutil.copy2(sites[0]/(package+'.py'),test_deps/(package+'.py'))
+        for metadata in sites[0].glob(package+'-*.dist-info'):
+            shutil.copytree(metadata,test_deps/metadata.name,dirs_exist_ok=True)
     command=['docker','run','--rm','--network','none','-e','PYTHONPATH=/app:/verification:/test-deps',
-             '-v',str(sites[0])+':/test-deps:ro','-v',str(backup/'candidate')+':/verification:ro',
+             '-v',str(test_deps)+':/test-deps:ro','-v',str(backup/'candidate')+':/verification:ro',
              '-w','/verification',meta['candidate'],'python','-m','pytest','-q','-p','no:cacheprovider',
              'tests/test_review_reliability.py','tests/test_finding_ledger.py','tests/test_runner.py',
              'tests/test_directed_review.py']
@@ -178,6 +203,7 @@ if __name__=='__main__':
         assert backup.resolve().parent==P.parent/'agent-fight-backups'
         meta=json.loads((backup/'deployment.json').read_text())
         if mode=='check': check(backup,meta)
+        elif mode=='image-check': check_image(backup,meta)
         elif mode=='switch': switch(backup,meta)
         elif mode=='verify': print(json.dumps(dict(health=health(),image=run('docker','inspect','--format={{.Image}}','agent-fight'))))
         else: raise ValueError(mode)

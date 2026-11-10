@@ -36,8 +36,23 @@ shared origins, stale metadata, explicit acceptance, cap output, exception paths
 task cleanup, diagnostic privacy and deployment preservation.
 
 Full Windows gate: 271 passed in 138.39 seconds using `python -m pytest -q`.
-`git diff --check` passed. Staged Linux/actual-image verification and deployment
-remain pending at this revision. Historical exact replay cannot
+`git diff --check` passed. Staged Linux gate: 271 passed in 47.89 seconds.
+Actual release-image focused checks: 40 passed in 0.63 seconds using the image's
+Python 3.11 runtime dependencies and only pure-Python test tooling. The host venv
+uses Python 3.12; it is not mounted wholesale into the image.
+Isolated schema bootstrap/integrity passed with schema 0012_review_requests and
+1,171 reviews retained. Python dependency inventories were identical; libbrotli1
+remained 1.1.0-2+deb13u1. Production deployment and host/workstation health checks
+passed; see PRODUCTION-DEPLOYMENT.md. RESULT: PASS (implementation and rollout).
+
+Deployment verification packaging was corrected to include the operational
+script imported by an existing test. BuildKit requires the checked local rollback
+tag rather than a raw image ID in FROM. Native libraries from the host's Python
+3.12 venv could not be used by image Python 3.11; only pure test tooling was
+copied, including pytest's py shim. These operator verification adjustments did
+not modify the tested application candidate or interrupt the service.
+
+Historical exact replay cannot
 be performed because old failed-run outputs were discarded; synthetic protocol
 regressions establish the repaired transitions without claiming historical model
 output or cost reconstruction. No new live model invocation is required to
